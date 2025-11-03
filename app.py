@@ -1,6 +1,7 @@
 # app.py — NBA Player Scouting + Team Dashboard
 # Data sourced 100% from nba_api; opponent/team rank tiles with tiered colors.
 # Visual structure and stat ordering preserved. Opponent ranks now computed on Team tab too.
+# Per 36 sections added for Player (multi-window) and Team (roster per36 tables).
 
 import time
 import datetime
@@ -182,6 +183,83 @@ def append_average_row(df: pd.DataFrame, label: str = "Average") -> pd.DataFrame
     out = pd.concat([out, pd.DataFrame([avg_row])], ignore_index=True)
     return out
 
+# ---------- Per-36 helpers (sum minutes/stats first, then scale) ----------
+def _safe_num(series):
+    return pd.to_numeric(series, errors="coerce").fillna(0.0)
+
+def compute_per36_from_logs(logs: pd.DataFrame) -> dict:
+    keys = ["PTS","REB","AST","PRA","FG2M","FG3M","FTM","OREB","DREB"]
+    if logs is None or logs.empty:
+        return {k: np.nan for k in keys}
+    need = ["MIN","PTS","REB","AST","FGM","FG3M","FTM","OREB","DREB"]
+    for c in need:
+        if c not in logs.columns:
+            logs[c] = 0
+        logs[c] = _safe_num(logs[c])
+
+    sum_min = logs["MIN"].sum()
+    sum_pts = logs["PTS"].sum()
+    sum_reb = logs["REB"].sum()
+    sum_ast = logs["AST"].sum()
+    sum_fgm = logs["FGM"].sum()
+    sum_fg3 = logs["FG3M"].sum()
+    sum_ftm = logs["FTM"].sum()
+    sum_oreb= logs["OREB"].sum()
+    sum_dreb= logs["DREB"].sum()
+    sum_pra = sum_pts + sum_reb + sum_ast
+    sum_fg2 = max(0.0, sum_fgm - sum_fg3)
+
+    def per36(x): return 36.0 * (x / sum_min) if sum_min and sum_min > 0 else np.nan
+    return {
+        "PTS":  per36(sum_pts),
+        "REB":  per36(sum_reb),
+        "AST":  per36(sum_ast),
+        "PRA":  per36(sum_pra),
+        "FG2M": per36(sum_fg2),
+        "FG3M": per36(sum_fg3),
+        "FTM":  per36(sum_ftm),
+        "OREB": per36(sum_oreb),
+        "DREB": per36(sum_dreb),
+    }
+
+def per36_from_career_totals(career_df: pd.DataFrame) -> dict:
+    keys = ["PTS","REB","AST","PRA","FG2M","FG3M","FTM","OREB","DREB"]
+    if career_df is None or career_df.empty:
+        return {k: np.nan for k in keys}
+    need = ["MIN","PTS","REB","AST","FGM","FG3M","FTM","OREB","DREB"]
+    for c in need:
+        if c not in career_df.columns:
+            career_df[c] = 0
+        career_df[c] = _safe_num(career_df[c])
+    sum_min = career_df["MIN"].sum()
+    sum_pts = career_df["PTS"].sum()
+    sum_reb = career_df["REB"].sum()
+    sum_ast = career_df["AST"].sum() if "AST" in career_df.columns else 0.0
+    sum_fgm = career_df["FGM"].sum()
+    sum_fg3 = career_df["FG3M"].sum()
+    sum_ftm = career_df["FTM"].sum()
+    sum_oreb= career_df["OREB"].sum()
+    sum_dreb= career_df["DREB"].sum()
+    sum_pra = sum_pts + sum_reb + sum_ast
+    sum_fg2 = max(0.0, sum_fgm - sum_fg3)
+
+    def per36(x): return 36.0 * (x / sum_min) if sum_min and sum_min > 0 else np.nan
+    return {
+        "PTS":  per36(sum_pts),
+        "REB":  per36(sum_reb),
+        "AST":  per36(sum_ast),
+        "PRA":  per36(sum_pra),
+        "FG2M": per36(sum_fg2),
+        "FG3M": per36(sum_fg3),
+        "FTM":  per36(sum_ftm),
+        "OREB": per36(sum_oreb),
+        "DREB": per36(sum_dreb),
+    }
+
+def _series_from_dict(d: dict, name: str) -> pd.Series:
+    s = pd.Series(d, dtype="float64"); s.name = name; return s
+
+# ----------------------- Team name helpers -----------------------
 def _build_static_maps():
     teams_df = pd.DataFrame(static_teams.get_teams())
     by_full = dict(zip(teams_df["full_name"].astype(str), teams_df["abbreviation"].astype(str)))
@@ -674,6 +752,65 @@ def player_dashboard():
         height=_auto_height(cmp_df)
     )
 
+    # ----------------------- NEW: Per 36 (Career/Prev/Current/L5/L10/L15/L20/L5 vs Opp) -----------------------
+    st.markdown("### Per 36 — Career / Season / Recency / Opponent")
+
+    # Build needed windows once
+    y0 = int(season.split("-")[0])
+    prev_season_label = f"{y0-1}-{str(y0 % 100).zfill(2)}"
+    prev_logs = get_player_logs(player_id, prev_season_label)
+
+    # Ensure base columns exist
+    for c in ["MIN","PTS","REB","AST","FGM","FG3M","FTM","OREB","DREB"]:
+        if c not in logs.columns: logs[c] = 0
+        if c not in prev_logs.columns: prev_logs[c] = 0
+
+    # vs opponent last 5 (use existing vs_opp_df logic below if available; otherwise fetch fresh)
+    opp_team_id = resolve_team_id(opponent, opp_row)
+    vs_opp_df = pd.DataFrame()
+    if opp_team_id:
+        vs_opp_df = get_vs_opponent_games(player_id, opp_team_id)
+
+    if vs_opp_df.empty:
+        opp_abbrev = resolve_team_abbrev(opponent, opp_row)
+        if "SEASON" in career_df.columns and not career_df.empty:
+            season_labels = list(career_df["SEASON"].dropna().unique())
+            def _yr(s):
+                try: return int(s.split("-")[0])
+                except: return -1
+            season_labels = sorted(season_labels, key=_yr, reverse=True)
+        else:
+            season_labels = SEASONS
+        if opp_abbrev:
+            all_logs = get_all_player_logs_all_seasons(player_id, season_labels)
+            if not all_logs.empty and "MATCHUP" in all_logs.columns:
+                all_logs = all_logs.copy()
+                all_logs["OPP_ABBR"] = all_logs["MATCHUP"].apply(parse_opp_from_matchup)
+                all_logs["OPP_ABBR"] = all_logs["OPP_ABBR"].apply(lambda x: ABBR_ALIAS.get(x, x) if isinstance(x, str) else x)
+                cols_base = ["GAME_DATE","MATCHUP","WL","MIN","PTS","REB","AST","FGM","FGA","FG3M","FG3A","FTM","FTA","OREB","DREB"]
+                vs_opp_df = all_logs[all_logs["OPP_ABBR"] == resolve_team_abbrev(opponent, opp_row)][cols_base].copy()
+
+    # Assemble rows
+    per36_rows = []
+    per36_rows.append(_series_from_dict(per36_from_career_totals(career_df), "Career Per 36"))
+    per36_rows.append(_series_from_dict(compute_per36_from_logs(prev_logs),  "Prev Season Per 36"))
+    per36_rows.append(_series_from_dict(compute_per36_from_logs(logs),       "Current Season Per 36"))
+    per36_rows.append(_series_from_dict(compute_per36_from_logs(logs.head(5)),   "Last 5 Per 36"))
+    per36_rows.append(_series_from_dict(compute_per36_from_logs(logs.head(10)),  "Last 10 Per 36"))
+    per36_rows.append(_series_from_dict(compute_per36_from_logs(logs.head(15)),  "Last 15 Per 36"))
+    per36_rows.append(_series_from_dict(compute_per36_from_logs(logs.head(20)),  "Last 20 Per 36"))
+    if not vs_opp_df.empty:
+        per36_rows.append(_series_from_dict(compute_per36_from_logs(vs_opp_df.head(5)), f"Last 5 vs {opponent} Per 36"))
+    else:
+        per36_rows.append(_series_from_dict({k: np.nan for k in ["PTS","REB","AST","PRA","FG2M","FG3M","FTM","OREB","DREB"]}, f"Last 5 vs {opponent} Per 36"))
+
+    per36_df = pd.DataFrame(per36_rows)[["PTS","REB","AST","PRA","FG2M","FG3M","FTM","OREB","DREB"]].round(2)
+    st.dataframe(
+        per36_df.style.format(numeric_format_map(per36_df)),
+        use_container_width=True,
+        height=_auto_height(per36_df)
+    )
+
     # ----------------------- Last 5 Games (current season) -----------------------
     st.markdown("### Last 5 Games")
     cols_base = ["GAME_DATE","MATCHUP","WL","MIN","PTS","REB","AST","FGM","FGA","FG3M","FG3A","FTM","FTA","OREB","DREB"]
@@ -718,7 +855,7 @@ def player_dashboard():
         num_fmt2 = {c: "{:.1f}" for c in vs_opp5.select_dtypes(include=[np.number]).columns if c != "GAME_DATE"}
         st.dataframe(vs_opp5.style.format(num_fmt2), use_container_width=True, height=_auto_height(vs_opp5))
 
-    st.caption("Notes: Opponent metrics are NBA-only ‘Regular Season’ through today’s ET date (5-min cache). MIN totals from Base (Totals); PACE/ratings from Advanced (PerGame).")
+    st.caption("Notes: Opponent metrics are NBA-only ‘Regular Season’ through today’s ET date (5-min cache). MIN totals from Base (Totals); PACE/ratings from Advanced (PerGame). Per-36 are computed by summing totals first, then scaling to 36.")
 
 # =====================================================================
 # Team Dashboard
@@ -808,6 +945,25 @@ def team_dashboard():
                 season_type_all_star="Regular Season",
                 league_id_nullable="00",
                 per_mode_detailed="PerGame",
+                last_n_games=last_n_games,
+            ),
+        )
+        df = frames[0] if frames else pd.DataFrame()
+        if df.empty:
+            return df
+        df = df[df["TEAM_ID"].astype(str).str.startswith("161061")].copy()
+        return df.reset_index(drop=True)
+
+    # NEW: per36 roster pulls
+    @st.cache_data(ttl=CACHE_HOURS*3600, show_spinner=True)
+    def fetch_league_players_per36(season: str, last_n_games: int) -> pd.DataFrame:
+        frames = _retry_api(
+            LeagueDashPlayerStats,
+            dict(
+                season=season,
+                season_type_all_star="Regular Season",
+                league_id_nullable="00",
+                per_mode_detailed="Per36",
                 last_n_games=last_n_games,
             ),
         )
@@ -925,7 +1081,6 @@ def team_dashboard():
     ranks["PLUS_MINUS"]  = _safe_rank("PLUS_MINUS", ascending=False)
 
     # ------- Opponent ranks on Team tab (added; mirrors Player tab behavior) -------
-    # Create _RANK columns directly in merged for OPP_ fields so tiles can read from row.
     def _add_opp_rank_team(col, ascending=True):
         if col in merged.columns:
             merged[f"{col}_RANK"] = merged[col].rank(ascending=ascending, method="min")
@@ -1003,7 +1158,7 @@ def team_dashboard():
         ("REB", "REB", False),
         ("AST", "AST", False),
     ])
-    # Row 4 (4)
+    # Row 4 (5)
     tile_row([
         ("TOV", "TOV", False),
         ("STL", "STL", False),
@@ -1047,7 +1202,7 @@ def team_dashboard():
         ("OPP_PF",  "Opp PF"),
     ])
 
-    # ----------------------- Roster tables -----------------------
+    # ----------------------- Roster tables (Per-Game) -----------------------
     with st.spinner("Loading roster per-game (season / last 5 / last 15)..."):
         season_pg = fetch_league_players_pg(season, last_n_games=0)
         last5_pg  = fetch_league_players_pg(season, last_n_games=5)
@@ -1110,10 +1265,50 @@ def team_dashboard():
             height=_auto_height_local(last15_tbl),
         )
 
+    # ----------------------- NEW: Roster — Per-36 (Season / Last 5 / Last 15) -----------------------
+    with st.spinner("Loading roster Per-36 (season / last 5 / last 15)..."):
+        season_p36 = fetch_league_players_per36(season, last_n_games=0)
+        last5_p36  = fetch_league_players_per36(season, last_n_games=5)
+        last15_p36 = fetch_league_players_per36(season, last_n_games=15)
+
+    season_p36_tbl = _prep_roster(season_p36, team_id)
+    last5_p36_tbl  = _prep_roster(last5_p36, team_id)
+    last15_p36_tbl = _prep_roster(last15_p36, team_id)
+
+    st.markdown("### Roster — Season Per-36")
+    if season_p36_tbl.empty:
+        st.info("No season Per-36 data for this team.")
+    else:
+        st.dataframe(
+            season_p36_tbl.style.format(_num_fmt_map(season_p36_tbl)),
+            use_container_width=True,
+            height=_auto_height_local(season_p36_tbl),
+        )
+
+    st.markdown("### Roster — Last 5 Games (Per-36)")
+    if last5_p36_tbl.empty:
+        st.info("No Last 5 Per-36 data for this team.")
+    else:
+        st.dataframe(
+            last5_p36_tbl.style.format(_num_fmt_map(last5_p36_tbl)),
+            use_container_width=True,
+            height=_auto_height_local(last5_p36_tbl),
+        )
+
+    st.markdown("### Roster — Last 15 Games (Per-36)")
+    if last15_p36_tbl.empty:
+        st.info("No Last 15 Per-36 data for this team.")
+    else:
+        st.dataframe(
+            last15_p36_tbl.style.format(_num_fmt_map(last15_p36_tbl)),
+            use_container_width=True,
+            height=_auto_height_local(last15_p36_tbl),
+        )
+
     st.caption(
         "Notes: Team stats from NBA.com LeagueDashTeamStats (Traditional & Advanced, Per-Game) + Opponent (Per-Game). "
-        "Player roster per-game from LeagueDashPlayerStats with last_n_games filters (0/5/15). "
-        "All fields displayed are sourced directly from the API (no local shooting derivations)."
+        "Player roster per-game and per-36 from LeagueDashPlayerStats with last_n_games filters (0/5/15). "
+        "Per-36 tables mirror the per-game roster structure for readability."
     )
 
 # =====================================================================
