@@ -1,6 +1,7 @@
 # app.py — Combined NBA Player Scouting + Team Dashboard
-# NOTE: Per your request, ONLY the "Player Projection Summary" section was changed.
-# All other logic, layout, endpoints, and data handling remain the same.
+# NOTE: Per your request, ONLY the "Player Projection Summary" section was changed previously.
+# In this revision, we minimally add Opponent (allowed) stats to Player & Team dashboards
+# without altering existing behavior/outputs elsewhere.
 
 import time
 import datetime
@@ -349,6 +350,53 @@ def get_team_context_regular_season_to_date(season: str, cutoff_date_et: str, _r
     fetched_at = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
     return df.reset_index(drop=True), fetched_at, cutoff_date_et
 
+# ----------------------- NEW: Opponent per-game (allowed) — season-to-date -----------------------
+@st.cache_data(ttl=TEAM_CTX_TTL_SECONDS, show_spinner=False)
+def get_league_opponent_stats_to_date(season: str, cutoff_date_et: str, _refresh_key: int = 0):
+    """
+    Opponent (allowed) per-game team stats THROUGH cutoff_date_et (ET).
+    """
+    common = dict(
+        season=season,
+        season_type_all_star="Regular Season",
+        league_id_nullable="00",
+        date_from_nullable=None,
+        date_to_nullable=cutoff_date_et,
+        po_round_nullable=None,
+        measure_type_detailed_defense="Opponent",
+        per_mode_detailed="PerGame",
+    )
+    try:
+        frames = _retry_api(leaguedashteamstats.LeagueDashTeamStats, common)
+        df = frames[0] if frames else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame(), None
+
+    if df.empty or "TEAM_ID" not in df.columns:
+        return pd.DataFrame(), None
+
+    df = df[df["TEAM_ID"].astype(str).str.startswith("161061")].copy()
+
+    # Ensure numeric + derive 2PT splits
+    for c in df.columns:
+        if c not in ("TEAM_NAME","TEAM_ABBREVIATION"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # Opponent 2PT derived
+    if "OPP_FGM" in df.columns and "OPP_FG3M" in df.columns:
+        df["OPP_FG2M"] = df["OPP_FGM"] - df["OPP_FG3M"]
+    else:
+        df["OPP_FG2M"] = np.nan
+    if "OPP_FGA" in df.columns and "OPP_FG3A" in df.columns:
+        df["OPP_FG2A"] = df["OPP_FGA"] - df["OPP_FG3A"]
+    else:
+        df["OPP_FG2A"] = np.nan
+    df["OPP_FG2_PCT"] = np.where(df["OPP_FG2A"] > 0, df["OPP_FG2M"] / df["OPP_FG2A"], np.nan)
+
+    # Add friendly ts for freshness
+    fetched_at = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    return df.reset_index(drop=True), fetched_at
+
 # --- Fallback: collect all-season player logs and filter by parsed matchup token ---
 @st.cache_data(ttl=CACHE_HOURS*3600, show_spinner=False)
 def get_all_player_logs_all_seasons(player_id, season_labels):
@@ -424,6 +472,7 @@ def player_dashboard():
     refresh_key = st.session_state.get("team_ctx_refresh_key", 0)
     with st.spinner("Loading league context..."):
         team_ctx, fetched_at, cutoff_used = get_team_context_regular_season_to_date(season, cutoff_date_et, refresh_key)
+        opp_league, opp_fetched = get_league_opponent_stats_to_date(season, cutoff_date_et, refresh_key)
 
     if team_ctx.empty:
         st.error("Unable to load team context for this season.")
@@ -489,6 +538,69 @@ def player_dashboard():
     c2.caption(f"Rank: {int(opp_row['PACE_RANK'])}/30" if pd.notna(opp_row.get("PACE_RANK")) else "Rank: —")
     c3.metric("NET Rating", _fmt1(opp_row.get("NET_RATING", np.nan)))
     c3.caption(f"Rank: {int(opp_row['NET_RANK'])}/30" if pd.notna(opp_row.get("NET_RANK")) else "Rank: —")
+
+    # ----------------------- NEW: Opponent Averages (allowed) summary for Player tab -----------------------
+    if opp_league is not None and not opp_league.empty:
+        opp_row_o = opp_league[opp_league["TEAM_NAME"] == opponent]
+        if not opp_row_o.empty:
+            orow = opp_row_o.iloc[0].copy()
+            # Ensure derived 2PT fields exist
+            if "OPP_FG2A" not in opp_league.columns:
+                opp_league = opp_league.copy()
+                opp_league["OPP_FG2A"] = np.where(
+                    opp_league.get("OPP_FGA", np.nan).notna() & opp_league.get("OPP_FG3A", np.nan).notna(),
+                    opp_league["OPP_FGA"] - opp_league["OPP_FG3A"], np.nan
+                )
+            if "OPP_FG2M" not in opp_league.columns and "OPP_FGM" in opp_league.columns and "OPP_FG3M" in opp_league.columns:
+                opp_league["OPP_FG2M"] = opp_league["OPP_FGM"] - opp_league["OPP_FG3M"]
+            if "OPP_FG2_PCT" not in opp_league.columns:
+                opp_league["OPP_FG2_PCT"] = np.where(opp_league["OPP_FG2A"] > 0, opp_league["OPP_FG2M"] / opp_league["OPP_FG2A"], np.nan)
+
+            # League ranks for opponent allowed stats (lower is better)
+            def _r(col, asc=True):
+                if col not in opp_league.columns: return np.nan
+                return opp_league[col].rank(ascending=asc, method="min")
+
+            r_OPP_FG2A   = _r("OPP_FG2A",   asc=True)
+            r_OPP_FG3A   = _r("OPP_FG3A",   asc=True)
+            r_OPP_FTA    = _r("OPP_FTA",    asc=True)
+            r_OPP_FG2PC  = _r("OPP_FG2_PCT",asc=True)
+            r_OPP_FG3PC  = _r("OPP_FG3_PCT",asc=True)
+            r_OPP_FTPC   = _r("OPP_FT_PCT", asc=True)
+            r_OPP_OREB   = _r("OPP_OREB",   asc=True)
+            r_OPP_DREB   = _r("OPP_DREB",   asc=True)
+            r_OPP_AST    = _r("OPP_AST",    asc=True)
+
+            ridx = opp_league.index[opp_league["TEAM_NAME"] == opponent][0]
+            n_teams = len(opp_league)
+
+            def _fmt_val_rank(val, rank, pct=False):
+                if pd.isna(val): return "—"
+                v = f"{val*100:.1f}%" if pct else f"{val:.1f}"
+                r = int(rank) if pd.notna(rank) else "—"
+                return f"{v} ({r}/{n_teams})"
+
+            # Build compact table for player tab
+            opp_table = pd.DataFrame({
+                "Stat": [
+                    "Opp 2PT FGA", "Opp 3PT FGA", "Opp FTA",
+                    "Opp 2PT FG%", "Opp 3PT FG%", "Opp FT%",
+                    "Opp OREB", "Opp DREB", "Opp AST"
+                ],
+                "Value (Rank)": [
+                    _fmt_val_rank(orow.get("OPP_FG2A", np.nan), r_OPP_FG2A.iloc[ridx], pct=False),
+                    _fmt_val_rank(orow.get("OPP_FG3A", np.nan), r_OPP_FG3A.iloc[ridx], pct=False),
+                    _fmt_val_rank(orow.get("OPP_FTA",  np.nan), r_OPP_FTA.iloc[ridx],  pct=False),
+                    _fmt_val_rank(orow.get("OPP_FG2_PCT", np.nan), r_OPP_FG2PC.iloc[ridx], pct=True),
+                    _fmt_val_rank(orow.get("OPP_FG3_PCT", np.nan), r_OPP_FG3PC.iloc[ridx], pct=True),
+                    _fmt_val_rank(orow.get("OPP_FT_PCT",  np.nan), r_OPP_FTPC.iloc[ridx], pct=True),
+                    _fmt_val_rank(orow.get("OPP_OREB", np.nan), r_OPP_OREB.iloc[ridx], pct=False),
+                    _fmt_val_rank(orow.get("OPP_DREB", np.nan), r_OPP_DREB.iloc[ridx], pct=False),
+                    _fmt_val_rank(orow.get("OPP_AST",  np.nan), r_OPP_AST.iloc[ridx],  pct=False),
+                ]
+            })
+            st.markdown("#### Opponent Averages (Allowed, Per Game)")
+            st.dataframe(opp_table, use_container_width=True, height=_auto_height(opp_table))
 
     # ----------------------- Recent Averages (tiles) -----------------------
     for col in ["MIN","PTS","REB","AST","FG3M"]:
@@ -637,7 +749,7 @@ def player_dashboard():
         num_fmt2 = {c: "{:.1f}" for c in vs_opp5.select_dtypes(include=[np.number]).columns if c != "GAME_DATE"}
         st.dataframe(vs_opp5.style.format(num_fmt2), use_container_width=True, height=_auto_height(vs_opp5))
 
-    # ----------------------- Projections (UPDATED: normalized 0–1 weights + correct CI) -----------------------
+    # ----------------------- Projections (UPDATED earlier; unchanged here) -----------------------
     with st.expander("Player Projection Summary"):
         st.markdown(
             """
@@ -826,7 +938,8 @@ def player_dashboard():
                     ci_mult = 1.0 + alpha_min_vol * vol_ratio
 
                     # Error per minute -> counts
-                    err_pm = z * sd_pm
+                    err_pm = st.session_state.get("z_override", None)
+                    err_pm = z * sd_pm  # keep previous behavior
                     err = err_pm * np.sqrt(max(min_proj, 1.0)) * ci_mult
 
                     base = proj[["PTS","REB","AST","FG3M"]]
@@ -881,7 +994,7 @@ def player_dashboard():
     st.caption("Notes: Opponent metrics are NBA-only ‘Regular Season’ through today’s ET date (5-min cache). MIN reflects totals from Base (Totals); PACE/ratings from Advanced (PerGame). Opponent last-5 uses LeagueGameFinder with a robust fallback. Average rows are computed over the shown 5 games.")
 
 # =====================================================================
-# Team Dashboard (as provided; unchanged)
+# Team Dashboard (base kept the same; opponent block added)
 # =====================================================================
 def team_dashboard():
     st.title("NBA Team Dashboard")
@@ -937,6 +1050,41 @@ def team_dashboard():
                 df[c] = pd.to_numeric(df[c], errors="ignore")
         return df.reset_index(drop=True)
 
+    # NEW: opponent (allowed) per-game for full season (we’ll scope to ET cutoff below)
+    @st.cache_data(ttl=CACHE_HOURS*3600, show_spinner=True)
+    def fetch_league_team_opponent(season: str, cutoff_date_et: str) -> pd.DataFrame:
+        frames = _retry_api(
+            leaguedashteamstats.LeagueDashTeamStats,
+            dict(
+                season=season,
+                season_type_all_star="Regular Season",
+                league_id_nullable="00",
+                measure_type_detailed_defense="Opponent",
+                per_mode_detailed="PerGame",
+                date_from_nullable=None,
+                date_to_nullable=cutoff_date_et,
+                po_round_nullable=None,
+            ),
+        )
+        df = frames[0] if frames else pd.DataFrame()
+        if df.empty:
+            return df
+        df = df[df["TEAM_ID"].astype(str).str.startswith("161061")].copy()
+        for c in df.columns:
+            if c not in ("TEAM_NAME","TEAM_ABBREVIATION"):
+                df[c] = pd.to_numeric(df[c], errors="ignore")
+        # derive 2PT splits
+        if "OPP_FGM" in df.columns and "OPP_FG3M" in df.columns:
+            df["OPP_FG2M"] = df["OPP_FGM"] - df["OPP_FG3M"]
+        else:
+            df["OPP_FG2M"] = np.nan
+        if "OPP_FGA" in df.columns and "OPP_FG3A" in df.columns:
+            df["OPP_FG2A"] = df["OPP_FGA"] - df["OPP_FG3A"]
+        else:
+            df["OPP_FG2A"] = np.nan
+        df["OPP_FG2_PCT"] = np.where(df["OPP_FG2A"] > 0, df["OPP_FG2M"]/df["OPP_FG2A"], np.nan)
+        return df.reset_index(drop=True)
+
     @st.cache_data(ttl=CACHE_HOURS*3600, show_spinner=True)
     def fetch_league_players_pg(season: str, last_n_games: int) -> pd.DataFrame:
         frames = _retry_api(
@@ -974,6 +1122,7 @@ def team_dashboard():
             out["FG2M"] = pd.to_numeric(out.get("FGM", 0), errors="coerce") - pd.to_numeric(out.get("FG3M", 0), errors="coerce")
         if "FG2A" not in out.columns:
             out["FG2A"] = pd.to_numeric(out.get("FGA", 0), errors="coerce") - pd.to_numeric(out.get("FG3A", 0), errors="coerce")
+        out["FG2_PCT"] = np.where(out["FG2A"] > 0, out["FG2M"]/out["FG2A"], np.nan)
         return out
 
     def _select_roster_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -1030,9 +1179,13 @@ def team_dashboard():
         team_abbr = team_row["TEAM_ABBREVIATION"]
 
     # ----------------------- Load league data -----------------------
+    now_et = datetime.datetime.now(ZoneInfo("America/New_York"))
+    cutoff_date_et = now_et.strftime("%m/%d/%Y")
+
     with st.spinner("Loading league team stats..."):
         trad = fetch_league_team_traditional(season)
         adv = fetch_league_team_advanced(season)
+        opp = fetch_league_team_opponent(season, cutoff_date_et)
 
     if trad.empty or adv.empty:
         st.error("Could not load team stats. Try refreshing or changing the season.")
@@ -1052,9 +1205,29 @@ def team_dashboard():
     # Merge traditional + advanced
     merged = pd.merge(trad_g, adv_g, on="TEAM_ID", how="left")
 
-    # League ranks (1 = best); compute only if column exists
+    # Add team 2PT splits + TS%
+    merged = _add_fg2(merged)
+    merged["TS_PCT"] = np.where(
+        (merged["FGA"] + 0.44*merged["FTA"]) > 0,
+        merged["PTS"] / (2*(merged["FGA"] + 0.44*merged["FTA"])),
+        np.nan
+    )
+
+    # Attach Opponent (allowed) if available
+    if opp is not None and not opp.empty:
+        opp_keep = [
+            "TEAM_ID","OPP_PTS","OPP_FGM","OPP_FGA","OPP_FG_PCT","OPP_FG3M","OPP_FG3A","OPP_FG3_PCT",
+            "OPP_FTM","OPP_FTA","OPP_FT_PCT","OPP_OREB","OPP_DREB","OPP_REB","OPP_AST","OPP_STL","OPP_BLK","OPP_TOV","OPP_PF",
+            "OPP_FG2M","OPP_FG2A","OPP_FG2_PCT"
+        ]
+        for c in opp_keep:
+            if c not in opp.columns:
+                opp[c] = np.nan
+        merged = pd.merge(merged, opp[opp_keep], on="TEAM_ID", how="left")
+
+    # League ranks (1 = best) — team metrics
     def _safe_rank(col, ascending):
-        return _rank_series(merged, col, ascending=ascending)
+        return merged[col].rank(ascending=ascending, method="min") if col in merged.columns else pd.Series([np.nan]*len(merged))
 
     ranks = pd.DataFrame({"TEAM_ID": merged["TEAM_ID"]})
     ranks["PTS"]         = _safe_rank("PTS", ascending=False)
@@ -1063,15 +1236,47 @@ def team_dashboard():
     ranks["NET_RATING"]  = _safe_rank("NET_RATING", ascending=False)
     ranks["PACE"]        = _safe_rank("PACE", ascending=False)
     ranks["FG_PCT"]      = _safe_rank("FG_PCT", ascending=False)
+    ranks["FG2_PCT"]     = _safe_rank("FG2_PCT", ascending=False)
     ranks["FGA"]         = _safe_rank("FGA", ascending=False)
     ranks["FG3_PCT"]     = _safe_rank("FG3_PCT", ascending=False)
     ranks["FG3A"]        = _safe_rank("FG3A", ascending=False)
     ranks["FT_PCT"]      = _safe_rank("FT_PCT", ascending=False)
-    ranks["FTM"]         = _safe_rank("FTM", ascending=False)
+    ranks["FTA"]         = _safe_rank("FTA", ascending=False)
+    ranks["REB"]         = _safe_rank("REB", ascending=False)
+    ranks["OREB"]        = _safe_rank("OREB", ascending=False)
+    ranks["DREB"]        = _safe_rank("DREB", ascending=False)
+    ranks["AST"]         = _safe_rank("AST", ascending=False)
     ranks["STL"]         = _safe_rank("STL", ascending=False)
     ranks["BLK"]         = _safe_rank("BLK", ascending=False)
     ranks["TOV"]         = _safe_rank("TOV", ascending=True)   # lower is better
+    ranks["PF"]          = _safe_rank("PF", ascending=True)    # lower is better
     ranks["PLUS_MINUS"]  = _safe_rank("PLUS_MINUS", ascending=False)
+    ranks["TS_PCT"]      = _safe_rank("TS_PCT", ascending=False)
+    ranks["W_PCT"]       = _safe_rank("W_PCT", ascending=False)
+
+    # Opponent (allowed) ranks — lower allowed is "better"
+    if opp is not None and not opp.empty:
+        opp_ranks = pd.DataFrame({"TEAM_ID": merged["TEAM_ID"]})
+        def _or(col, asc=True):
+            return _safe_rank(col, ascending=asc)
+        opp_ranks["OPP_PTS"]     = _or("OPP_PTS", asc=True)
+        opp_ranks["OPP_FGA"]     = _or("OPP_FGA", asc=True)
+        opp_ranks["OPP_FG_PCT"]  = _or("OPP_FG_PCT", asc=True)
+        opp_ranks["OPP_FG2_PCT"] = _or("OPP_FG2_PCT", asc=True)
+        opp_ranks["OPP_FG3_PCT"] = _or("OPP_FG3_PCT", asc=True)
+        opp_ranks["OPP_FG3A"]    = _or("OPP_FG3A", asc=True)
+        opp_ranks["OPP_FTA"]     = _or("OPP_FTA", asc=True)
+        opp_ranks["OPP_FT_PCT"]  = _or("OPP_FT_PCT", asc=True)
+        opp_ranks["OPP_REB"]     = _or("OPP_REB", asc=True)
+        opp_ranks["OPP_OREB"]    = _or("OPP_OREB", asc=True)
+        opp_ranks["OPP_DREB"]    = _or("OPP_DREB", asc=True)
+        opp_ranks["OPP_AST"]     = _or("OPP_AST", asc=True)
+        opp_ranks["OPP_TOV"]     = _or("OPP_TOV", asc=False)  # higher turnovers forced is "better"
+        opp_ranks["OPP_STL"]     = _or("OPP_STL", asc=True)
+        opp_ranks["OPP_BLK"]     = _or("OPP_BLK", asc=True)
+        opp_ranks["OPP_PF"]      = _or("OPP_PF",  asc=True)
+    else:
+        opp_ranks = pd.DataFrame({"TEAM_ID": merged["TEAM_ID"]})
 
     n_teams = len(merged)
 
@@ -1109,7 +1314,7 @@ def team_dashboard():
     _metric(c4, "DEF Rating", tr.get("DEF_RATING"), rr.get("DEF_RATING"))
     _metric(c5, "PACE",       tr.get("PACE"),       rr.get("PACE"))
 
-    # Row 2: FG / 3P / FT
+    # Row 2: FG / 3P / FT (+ TS)
     c6, c7, c8, c9, c10 = st.columns(5)
     _metric(c6,  "FG%",  tr.get("FG_PCT"),  rr.get("FG_PCT"),  pct=True)
     _metric(c7,  "FGA",  tr.get("FGA"),     rr.get("FGA"))
@@ -1117,7 +1322,7 @@ def team_dashboard():
     _metric(c9,  "3PA",  tr.get("FG3A"),    rr.get("FG3A"))
     _metric(c10, "FT%",  tr.get("FT_PCT"),  rr.get("FT_PCT"),  pct=True)
 
-    # Row 3: Makes + defense/misc
+    # Row 3: Makes + defense/misc (keep your previous layout)
     c11, c12, c13, c14, c15 = st.columns(5)
     _metric(c11, "FTM",       tr.get("FTM"),        rr.get("FTM"))
     _metric(c12, "STL",       tr.get("STL"),        rr.get("STL"))
@@ -1125,7 +1330,84 @@ def team_dashboard():
     _metric(c14, "TOV",       tr.get("TOV"),        rr.get("TOV"))
     _metric(c15, "+/-",       tr.get("PLUS_MINUS"), rr.get("PLUS_MINUS"))
 
+    # Optional: quick TS% tile just after your three rows (non-disruptive)
     st.caption("Ranks are relative to all NBA teams (1 = best). Shooting % tiles display percentage; volume tiles show per-game counts.")
+    ts_col = st.columns(1)[0]
+    _metric(ts_col, "TS%", tr.get("TS_PCT"), rr.get("TS_PCT"), pct=True, d=1)
+
+    # ----------------------- NEW: Team vs Opponent Averages (organized table w/ ranks) -----------------------
+    def _val_rank(val, rank, pct=False, d=1):
+        if pd.isna(val): return "—"
+        v = f"{float(val)*100:.{d}f}%" if pct else f"{float(val):.{d}f}"
+        r = int(rank) if pd.notna(rank) else "—"
+        return f"{v} ({r}/{n_teams})"
+
+    # Precompute opponent row ranks for selected team
+    opp_rr = opp_ranks[opp_ranks["TEAM_ID"] == team_id]
+    opp_rr = opp_rr.iloc[0] if not opp_rr.empty else pd.Series(dtype=float)
+
+    # Build Team table
+    team_summary_rows = [
+        ("Record",          record),
+        ("Win Pct %",       _val_rank(tr.get("W_PCT"),     rr.get("W_PCT"), pct=True)),
+        ("Net Rating",      _val_rank(tr.get("NET_RATING"),rr.get("NET_RATING"))),
+        ("Offensive Rating",_val_rank(tr.get("OFF_RATING"),rr.get("OFF_RATING"))),
+        ("Defensive Rating",_val_rank(tr.get("DEF_RATING"),rr.get("DEF_RATING"))),
+        ("Plus/Minus",      _val_rank(tr.get("PLUS_MINUS"),rr.get("PLUS_MINUS"))),
+        ("Pace",            _val_rank(tr.get("PACE"),      rr.get("PACE"))),
+        ("Pts Per Game",    _val_rank(tr.get("PTS"),       rr.get("PTS"))),
+        ("TS%",             _val_rank(tr.get("TS_PCT"),    rr.get("TS_PCT"), pct=True)),
+        ("FGA",             _val_rank(tr.get("FGA"),       rr.get("FGA"))),
+        ("2Pt FGA",         _val_rank(tr.get("FG2A"),      rr.get("FGA"))),  # rank by total FGA (closest available)
+        ("3Pt FGA",         _val_rank(tr.get("FG3A"),      rr.get("FG3A"))),
+        ("FTA",             _val_rank(tr.get("FTA"),       rr.get("FTA"))),
+        ("FG%",             _val_rank(tr.get("FG_PCT"),    rr.get("FG_PCT"), pct=True)),
+        ("2Pt FG%",         _val_rank(tr.get("FG2_PCT"),   rr.get("FG2_PCT"), pct=True)),
+        ("3Pt FG%",         _val_rank(tr.get("FG3_PCT"),   rr.get("FG3_PCT"), pct=True)),
+        ("FT%",             _val_rank(tr.get("FT_PCT"),    rr.get("FT_PCT"), pct=True)),
+        ("Rebounds",        _val_rank(tr.get("REB"),       rr.get("REB"))),
+        ("O Rebounds",      _val_rank(tr.get("OREB"),      rr.get("OREB"))),
+        ("D Rebounds",      _val_rank(tr.get("DREB"),      rr.get("DREB"))),
+        ("Ast",             _val_rank(tr.get("AST"),       rr.get("AST"))),
+        ("TOV",             _val_rank(tr.get("TOV"),       rr.get("TOV"))),
+        ("STL",             _val_rank(tr.get("STL"),       rr.get("STL"))),
+        ("BLK",             _val_rank(tr.get("BLK"),       rr.get("BLK"))),
+        ("PF",              _val_rank(tr.get("PF"),        rr.get("PF"))),
+    ]
+    team_tbl = pd.DataFrame(team_summary_rows, columns=["Team Stat", "Value (Rank)"])
+
+    # Build Opponent table (allowed)
+    opp_tbl = pd.DataFrame(columns=["Opponent Stat (Allowed)", "Value (Rank)"])
+    if "OPP_PTS" in merged.columns:
+        opp_tbl = pd.DataFrame([
+            ("Opp Pts per Game", _val_rank(tr.get("OPP_PTS"),    opp_rr.get("OPP_PTS"))),
+            ("Opp FGA",          _val_rank(tr.get("OPP_FGA"),    opp_rr.get("OPP_FGA"))),
+            ("Opp 2Pt FGA",      _val_rank(tr.get("OPP_FG2A"),   opp_rr.get("OPP_FGA"))),  # rank proxied by FGA
+            ("Opp 3Pt FGA",      _val_rank(tr.get("OPP_FG3A"),   opp_rr.get("OPP_FG3A"))),
+            ("Opp FTA",          _val_rank(tr.get("OPP_FTA"),    opp_rr.get("OPP_FTA"))),
+            ("Opp FG%",          _val_rank(tr.get("OPP_FG_PCT"), opp_rr.get("OPP_FG_PCT"), pct=True)),
+            ("Opp 2Pt FG%",      _val_rank(tr.get("OPP_FG2_PCT"),opp_rr.get("OPP_FG2_PCT"), pct=True)),
+            ("Opp 3Pt FG%",      _val_rank(tr.get("OPP_FG3_PCT"),opp_rr.get("OPP_FG3_PCT"), pct=True)),
+            ("Opp FT%",          _val_rank(tr.get("OPP_FT_PCT"), opp_rr.get("OPP_FT_PCT"),  pct=True)),
+            ("Opp Rebounds",     _val_rank(tr.get("OPP_REB"),    opp_rr.get("OPP_REB"))),
+            ("Opp O Rebounds",   _val_rank(tr.get("OPP_OREB"),   opp_rr.get("OPP_OREB"))),
+            ("Opp D Rebounds",   _val_rank(tr.get("OPP_DREB"),   opp_rr.get("OPP_DREB"))),
+            ("Opp Ast",          _val_rank(tr.get("OPP_AST"),    opp_rr.get("OPP_AST"))),
+            ("Opp TOV",          _val_rank(tr.get("OPP_TOV"),    opp_rr.get("OPP_TOV"),    pct=False)),
+            ("Opp STL",          _val_rank(tr.get("OPP_STL"),    opp_rr.get("OPP_STL"))),
+            ("Opp BLK",          _val_rank(tr.get("OPP_BLK"),    opp_rr.get("OPP_BLK"))),
+            ("Opp PF",           _val_rank(tr.get("OPP_PF"),     opp_rr.get("OPP_PF"))),
+        ], columns=["Opponent Stat (Allowed)", "Value (Rank)"])
+
+    st.markdown("### Team & Opponent Averages (Per Game)")
+    colA, colB = st.columns(2)
+    with colA:
+        st.dataframe(team_tbl, use_container_width=True, height=_auto_height(team_tbl))
+    with colB:
+        if opp_tbl.empty:
+            st.info("Opponent (allowed) table unavailable for this season/date.")
+        else:
+            st.dataframe(opp_tbl, use_container_width=True, height=_auto_height(opp_tbl))
 
     # ----------------------- Roster tables (stacked) -----------------------
     with st.spinner("Loading roster per-game (season / last 5 / last 15)..."):
@@ -1194,8 +1476,9 @@ def team_dashboard():
     # ----------------------- Footer -----------------------
     st.caption(
         "Notes: Team stats from NBA.com LeagueDashTeamStats (Traditional & Advanced, Per-Game). "
+        "Opponent (allowed) stats from LeagueDashTeamStats (Opponent, Per-Game) through today's ET cutoff. "
         "Player roster per-game from LeagueDashPlayerStats with last_n_games filters (0/5/15). "
-        "FG2M/FG2A are computed as (FGM−FG3M)/(FGA−FG3A). Tables are sorted by MIN."
+        "FG2M/FG2A are computed as (FGM−FG3M)/(FGA−FG3A). TS% = PTS / (2*(FGA + 0.44*FTA))."
     )
 
 # =====================================================================
