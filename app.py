@@ -1009,10 +1009,8 @@ def team_dashboard():
         ("STL", "STL", False),
         ("BLK", "BLK", False),
         ("PF",  "PF",  False),
+        ("+/-", "PLUS_MINUS", False),
     ])
-    # Row 5 (1) — Plus/Minus
-    c_pm, = st.columns(1)
-    _rank_tile(c_pm, "+/-", tr.get("PLUS_MINUS"), rr.get("PLUS_MINUS"), total=n_teams, pct=False)
 
     st.caption("Ranks are relative to all NBA teams (1 = best). Tile color and arrow reflect tier (top/middle/bottom).")
 
