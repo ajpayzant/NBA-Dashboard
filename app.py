@@ -1,5 +1,4 @@
-# app.py — NBA Player Scouting + Team Dashboard
-# Keeps data 100% from nba_api; adds rank-aware colored tiles; Team tiles reordered per request.
+# app.py — NBA Player Scouting + Team Dashboard (with opponent ranks on Team tab)
 
 import time
 import datetime
@@ -9,7 +8,7 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 import re
-from zoneinfo import ZoneInfo  # ET cutoff for season-to-date
+from zoneinfo import ZoneInfo
 
 from nba_api.stats.static import teams as static_teams
 from nba_api.stats.endpoints import (
@@ -58,73 +57,6 @@ def _prev_season_label(season_label: str) -> str:
     except Exception:
         return season_label
 
-# ----------------------- UI Helpers (rank-aware tiles) -----------------------
-def inject_rank_tile_css():
-    st.markdown(
-        """
-        <style>
-        .rank-tile { border-radius: 14px; padding: 10px 12px; margin: 4px 0; border: 1px solid rgba(0,0,0,0.08); }
-        .rank-tile .label { font-size: 0.85rem; opacity: 0.85; margin-bottom: 4px; }
-        .rank-tile .value { font-weight: 700; font-size: 1.25rem; line-height: 1.2; }
-        .rank-tile .delta { font-size: 0.8rem; margin-top: 2px; opacity: 0.9; }
-        .rank-good  { background: rgba(0,170,85,0.16); }
-        .rank-mid   { background: rgba(180,180,180,0.16); }
-        .rank-bad   { background: rgba(220,30,40,0.16); }
-        @media (prefers-color-scheme: dark) {
-            .rank-tile { border-color: rgba(255,255,255,0.12); }
-            .rank-good  { background: rgba(0,170,85,0.22); }
-            .rank-mid   { background: rgba(200,200,200,0.10); }
-            .rank-bad   { background: rgba(255,60,70,0.22); }
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-def _fmt1(v):
-    try:
-        return f"{float(v):.1f}"
-    except Exception:
-        return "—"
-
-def _rank_tile(col, label, value, rank, total=30, pct=False, decimals=1):
-    """
-    Top 25% (1–8): green ▲
-    Middle (9–22): neutral •
-    Bottom 25% (23–30): red ▼
-    """
-    if pd.isna(rank):
-        tier_class, arrow, rank_txt = "rank-mid", "•", "Rank —"
-    else:
-        r = int(rank)
-        if r <= 8:
-            tier_class, arrow = "rank-good", "▲"
-        elif r >= 23:
-            tier_class, arrow = "rank-bad", "▼"
-        else:
-            tier_class, arrow = "rank-mid", "•"
-        rank_txt = f"{arrow} Rank {r}/{total}"
-
-    if pct:
-        val_txt = f"{float(value)*100:.{decimals}f}%" if pd.notna(value) else "—"
-    else:
-        try:
-            val_txt = f"{float(value):.{decimals}f}" if pd.notna(value) else "—"
-        except Exception:
-            val_txt = "—"
-
-    col.markdown(
-        f"""
-        <div class="rank-tile {tier_class}">
-            <div class="label">{label}</div>
-            <div class="value">{val_txt}</div>
-            <div class="delta">{rank_txt}</div>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-# ----------------------- Misc Utils -----------------------
 def numeric_format_map(df):
     num_cols = df.select_dtypes(include=[np.number]).columns
     return {c: "{:.2f}" for c in num_cols}
@@ -132,6 +64,12 @@ def numeric_format_map(df):
 def _auto_height(df, row_px=34, header_px=38, max_px=900):
     rows = max(len(df), 1)
     return min(max_px, header_px + row_px * rows + 8)
+
+def _fmt1(v):
+    try:
+        return f"{float(v):.1f}"
+    except Exception:
+        return "—"
 
 _punct_re = re.compile(r"[^\w]")
 def parse_opp_from_matchup(matchup_str: str):
@@ -185,7 +123,6 @@ def _build_static_maps():
     teams_df = pd.DataFrame(static_teams.get_teams())
     by_full = dict(zip(teams_df["full_name"].astype(str), teams_df["abbreviation"].astype(str)))
     id_by_full = dict(zip(teams_df["full_name"].astype(str), teams_df["id"].astype(int)))
-
     nick_map = {
         "LA Clippers": "LAC", "Los Angeles Clippers": "LAC",
         "LA Lakers": "LAL", "Los Angeles Lakers": "LAL",
@@ -205,7 +142,6 @@ def _build_static_maps():
         "PHI 76ers": "PHI", "Philadelphia 76ers": "PHI",
     }
     alias_map = {"PHO":"PHX","BRK":"BKN","NJN":"BKN","NOH":"NOP","NOK":"NOP","CHO":"CHA","CHH":"CHA","SEA":"OKC","WSB":"WAS","VAN":"MEM"}
-
     by_full_cf = {k.casefold(): v for k, v in by_full.items()}
     nick_cf = {k.casefold(): v for k, v in nick_map.items()}
     alias_up = {k.upper(): v.upper() for k, v in alias_map.items()}
@@ -251,12 +187,9 @@ def get_season_player_index(season):
         df = frames[0] if frames else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
-    if df.empty:
-        return df
     keep = ["PLAYER_ID","PLAYER_NAME","TEAM_ID","TEAM_ABBREVIATION","TEAM_NAME","GP","MIN"]
     for c in keep:
-        if c not in df.columns:
-            df[c] = 0
+        if c not in df.columns: df[c] = 0
     return df[keep].drop_duplicates(subset=["PLAYER_ID"]).sort_values(["TEAM_NAME","PLAYER_NAME"]).reset_index(drop=True)
 
 @st.cache_data(ttl=CACHE_HOURS*3600, show_spinner=False)
@@ -292,7 +225,7 @@ def get_common_player_info(player_id):
     except Exception:
         return pd.DataFrame()
 
-# ----------------------- Team context for Player tab (ratings + opponent) -----------------------
+# ----------------------- Team context used on Player tab -----------------------
 @st.cache_data(ttl=TEAM_CTX_TTL_SECONDS, show_spinner=False)
 def get_team_context_regular_season_to_date(season: str, cutoff_date_et: str, _refresh_key: int = 0):
     common = dict(
@@ -303,7 +236,6 @@ def get_team_context_regular_season_to_date(season: str, cutoff_date_et: str, _r
         date_to_nullable=cutoff_date_et,
         po_round_nullable=None,
     )
-
     def _safe_frames(ep_cls, kwargs):
         try:
             frames = _retry_api(ep_cls, kwargs)
@@ -319,10 +251,6 @@ def get_team_context_regular_season_to_date(season: str, cutoff_date_et: str, _r
         leaguedashteamstats.LeagueDashTeamStats,
         dict(common, measure_type_detailed_defense="Base", per_mode_detailed="Totals"),
     )
-    opp = _safe_frames(
-        leaguedashteamstats.LeagueDashTeamStats,
-        dict(common, measure_type_detailed_defense="Opponent", per_mode_detailed="PerGame"),
-    )
 
     def _nba_only(df):
         if df is None or df.empty or "TEAM_ID" not in df.columns:
@@ -331,9 +259,8 @@ def get_team_context_regular_season_to_date(season: str, cutoff_date_et: str, _r
 
     adv = _nba_only(adv)
     base = _nba_only(base)
-    opp  = _nba_only(opp)
 
-    for df in (adv, base, opp):
+    for df in (adv, base):
         if not df.empty:
             df.sort_values(["TEAM_ID"], inplace=True)
             df.drop_duplicates(subset=["TEAM_ID"], keep="first", inplace=True)
@@ -348,19 +275,12 @@ def get_team_context_regular_season_to_date(season: str, cutoff_date_et: str, _r
         if c not in base.columns: base[c] = np.nan
     base = base[base_cols].copy()
 
-    opp_cols = [c for c in opp.columns if c.startswith("OPP_")] + ["TEAM_ID"]
-    opp = opp[opp_cols].copy() if not opp.empty else pd.DataFrame(columns=["TEAM_ID"])
-
     for c in ["PACE","OFF_RATING","DEF_RATING","NET_RATING"]:
         adv[c] = pd.to_numeric(adv[c], errors="coerce")
     for c in ["GP","W","L","W_PCT","MIN"]:
         base[c] = pd.to_numeric(base[c], errors="coerce")
-    for c in opp.columns:
-        if c != "TEAM_ID":
-            opp[c] = pd.to_numeric(opp[c], errors="coerce")
 
     df = pd.merge(adv, base, on="TEAM_ID", how="inner")
-    df = pd.merge(df, opp, on="TEAM_ID", how="left")
 
     teams_df = pd.DataFrame(static_teams.get_teams())
     abbr_map = dict(zip(teams_df["id"], teams_df["abbreviation"]))
@@ -400,29 +320,6 @@ def get_team_context_regular_season_to_date(season: str, cutoff_date_et: str, _r
     df["DEF_RANK"] = df["DEF_RATING"].rank(ascending=True,  method="min").astype("Int64")
     df["PACE_RANK"] = df["PACE"].rank(ascending=False, method="min").astype("Int64")
     df["NET_RANK"]  = df["NET_RATING"].rank(ascending=False, method="min").astype("Int64")
-
-    def _add_opp_rank(col, ascending=True):
-        if col in df.columns:
-            df[f"{col}_RANK"] = df[col].rank(ascending=ascending, method="min").astype("Int64")
-
-    for col, asc in [
-        ("OPP_PTS", True),
-        ("OPP_FG_PCT", True),
-        ("OPP_FG3_PCT", True),
-        ("OPP_FT_PCT", True),
-        ("OPP_REB", True),
-        ("OPP_OREB", True),
-        ("OPP_DREB", True),
-        ("OPP_AST", True),
-        ("OPP_TOV", False),
-        ("OPP_STL", False),
-        ("OPP_BLK", False),
-        ("OPP_PF", False),
-        ("OPP_FGA", True),
-        ("OPP_FG3A", True),
-        ("OPP_FTA", True),
-    ]:
-        _add_opp_rank(col, ascending=asc)
 
     df.sort_values("TEAM_NAME", inplace=True)
     fetched_at = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -474,7 +371,6 @@ def get_vs_opponent_games(player_id: int, opp_team_id: int):
 # Player Dashboard
 # =====================================================================
 def player_dashboard():
-    inject_rank_tile_css()
     st.title("NBA Player Scouting Dashboard")
 
     with st.sidebar:
@@ -549,45 +445,11 @@ def player_dashboard():
 
     st.markdown(f"### Opponent: **{opponent}** ({opp_record})")
     st.caption(f"Opponent metrics last updated: {fetched_at} • Season-to-date through (ET): {cutoff_used}")
-
     c1, c2, c3 = st.columns(3)
-    _rank_tile(c1, "DEF Rating", opp_row.get("DEF_RATING", np.nan), opp_row.get("DEF_RANK", np.nan), total=30, pct=False, decimals=1)
-    _rank_tile(c2, "PACE",       opp_row.get("PACE", np.nan),       opp_row.get("PACE_RANK", np.nan), total=30, pct=False, decimals=1)
-    _rank_tile(c3, "NET Rating", opp_row.get("NET_RATING", np.nan), opp_row.get("NET_RANK", np.nan),  total=30, pct=False, decimals=1)
+    c1.metric("DEF Rating", _fmt1(opp_row.get("DEF_RATING", np.nan)), f"Rank {int(opp_row['DEF_RANK'])}/30" if pd.notna(opp_row.get("DEF_RANK")) else None)
+    c2.metric("PACE", _fmt1(opp_row.get("PACE", np.nan)), f"Rank {int(opp_row['PACE_RANK'])}/30" if pd.notna(opp_row.get("PACE_RANK")) else None)
+    c3.metric("NET Rating", _fmt1(opp_row.get("NET_RATING", np.nan)), f"Rank {int(opp_row['NET_RANK'])}/30" if pd.notna(opp_row.get("NET_RANK")) else None)
 
-    st.markdown("#### Opponent Averages Allowed (Per-Game)")
-    def _opp_row(cols_labels):
-        cols = st.columns(len(cols_labels))
-        for (api_col, label), col in zip(cols_labels, cols):
-            val = opp_row.get(api_col, np.nan)
-            rank_col = f"{api_col}_RANK"
-            rnk = opp_row.get(rank_col, np.nan)
-            pct = api_col.endswith("_PCT")
-            _rank_tile(col, label, val, rnk, total=30, pct=pct, decimals=(1 if pct else 1))
-
-    _opp_row([
-        ("OPP_PTS",     "Opp PTS"),
-        ("OPP_FGA",     "Opp FGA"),
-        ("OPP_FG_PCT",  "Opp FG%"),
-        ("OPP_FG3A",    "Opp 3PA"),
-        ("OPP_FG3_PCT", "Opp 3P%"),
-    ])
-    _opp_row([
-        ("OPP_FTA",     "Opp FTA"),
-        ("OPP_FT_PCT",  "Opp FT%"),
-        ("OPP_OREB",    "Opp OREB"),
-        ("OPP_DREB",    "Opp DREB"),
-        ("OPP_REB",     "Opp REB"),
-    ])
-    _opp_row([
-        ("OPP_AST", "Opp AST"),
-        ("OPP_TOV", "Opp TOV"),
-        ("OPP_STL", "Opp STL"),
-        ("OPP_BLK", "Opp BLK"),
-        ("OPP_PF",  "Opp PF"),
-    ])
-
-    # ----------------------- Recent Averages -----------------------
     for col in ["MIN","PTS","REB","AST","FG3M"]:
         if col not in logs.columns:
             logs[col] = 0
@@ -602,7 +464,6 @@ def player_dashboard():
     m4.metric("AST", _fmt1(recent_avg.get("AST", np.nan)))
     m5.metric("3PM", _fmt1(recent_avg.get("FG3M", np.nan)))
 
-    # ----------------------- Trends -----------------------
     st.markdown(f"### Trends (Last {st.session_state.get('recent_sel','Season')} Games)")
     if "PRA" not in logs.columns:
         logs["PRA"] = logs.get("PTS", 0) + logs.get("REB", 0) + logs.get("AST", 0)
@@ -622,8 +483,11 @@ def player_dashboard():
     else:
         st.info("No trend data available to chart.")
 
-    # ----------------------- Compare Windows -----------------------
     st.markdown("### Compare Windows (Career / Prev Season / Current Season / L5 / L20)")
+    def avg(df, n):
+        if df.empty: return pd.Series(dtype=float)
+        if n == "Season": return df.mean(numeric_only=True)
+        return df.head(int(n)).mean(numeric_only=True)
 
     def career_per_game(career_df, cols=("MIN","PTS","REB","AST","FG3M")):
         if career_df.empty or "GP" not in career_df.columns:
@@ -637,9 +501,7 @@ def player_dashboard():
         out = {c: pd.to_numeric(career_df[c], errors="coerce").sum() / total_gp for c in cols}
         return pd.Series(out).astype(float)
 
-    if "FG3M" not in logs.columns:
-        logs["FG3M"] = 0
-
+    if "FG3M" not in logs.columns: logs["FG3M"] = 0
     metrics_order = ["MIN","PTS","REB","AST","FG3M"]
     career_pg = career_per_game(career_df, cols=metrics_order)
 
@@ -672,7 +534,6 @@ def player_dashboard():
         height=_auto_height(cmp_df)
     )
 
-    # ----------------------- Last 5 Games (current season) -----------------------
     st.markdown("### Last 5 Games")
     cols_base = ["GAME_DATE","MATCHUP","WL","MIN","PTS","REB","AST","FGM","FGA","FG3M","FG3A","FTM","FTA","OREB","DREB"]
     last5 = logs[cols_base].head(5).copy()
@@ -681,14 +542,11 @@ def player_dashboard():
     num_fmt = {c: "{:.1f}" for c in last5.select_dtypes(include=[np.number]).columns if c != "GAME_DATE"}
     st.dataframe(last5.style.format(num_fmt), use_container_width=True, height=_auto_height(last5))
 
-    # ----------------------- Last 5 vs Opponent (All Seasons) -----------------------
     st.markdown(f"### Last 5 Games vs {opponent}")
-
     opp_team_id = resolve_team_id(opponent, opp_row)
     vs_opp_df = pd.DataFrame()
     if opp_team_id:
         vs_opp_df = get_vs_opponent_games(player_id, opp_team_id)
-
     if vs_opp_df.empty:
         opp_abbrev = resolve_team_abbrev(opponent, opp_row)
         if "SEASON" in career_df.columns and not career_df.empty:
@@ -699,7 +557,6 @@ def player_dashboard():
             season_labels = sorted(season_labels, key=_yr, reverse=True)
         else:
             season_labels = SEASONS
-
         if opp_abbrev:
             all_logs = get_all_player_logs_all_seasons(player_id, season_labels)
             if not all_logs.empty and "MATCHUP" in all_logs.columns:
@@ -720,25 +577,17 @@ def player_dashboard():
         st.markdown(
             """
             #### How this projection works
-            This model blends multiple sources on a per-game basis—**Recent**, **Current Season**, **Previous Season**, **Career**, and (if available) **vs. Opponent**—then applies **defense** and **pace** adjustments for the selected opponent.  
-            - Use the **weights** (0.00–1.00 each). We’ll **normalize** your inputs to sum to 1.00 automatically.  
-            - Adjust **Projected MIN** to see projections scale accordingly.  
-            - Toggle the **Confidence Band** and choose **90% / 80% / 70%** intervals to see uncertainty bounds.
+            Blends **Recent / Season / Prev / Career / vs Opp** per-game sources, then applies **defense** and **pace** adjustments for the selected opponent.
+            Weights are normalized; minutes scale counts; confidence band uses robust per-minute variance with minutes-volatility.
             """
         )
-
         try:
             wc1, wc2, wc3, wc4, wc5 = st.columns(5)
-            with wc1:
-                w_recent_in = st.slider("Recent (0–1)", 0.00, 1.00, 0.45, 0.05)
-            with wc2:
-                w_season_in = st.slider("Season (0–1)", 0.00, 1.00, 0.25, 0.05)
-            with wc3:
-                w_prev_in   = st.slider("Prev (0–1)",   0.00, 1.00, 0.10, 0.05)
-            with wc4:
-                w_career_in = st.slider("Career (0–1)", 0.00, 1.00, 0.10, 0.05)
-            with wc5:
-                w_vsopp_in  = st.slider("Vs Opp (0–1)", 0.00, 1.00, 0.10, 0.05)
+            with wc1: w_recent_in = st.slider("Recent (0–1)", 0.00, 1.00, 0.45, 0.05)
+            with wc2: w_season_in = st.slider("Season (0–1)", 0.00, 1.00, 0.25, 0.05)
+            with wc3: w_prev_in   = st.slider("Prev (0–1)",   0.00, 1.00, 0.10, 0.05)
+            with wc4: w_career_in = st.slider("Career (0–1)", 0.00, 1.00, 0.10, 0.05)
+            with wc5: w_vsopp_in  = st.slider("Vs Opp (0–1)", 0.00, 1.00, 0.10, 0.05)
 
             cc1, cc2, cc3 = st.columns(3)
             with cc1:
@@ -765,8 +614,12 @@ def player_dashboard():
             prev_label = _prev_season_label(season)
             prev_logs_local = get_player_logs(player_id, prev_label)
             for c in METRICS:
-                if c not in prev_logs_local.columns: prev_logs_local[c] = 0
-            src["prev"] = prev_logs_local[METRICS].mean(numeric_only=True) if not prev_logs_local.empty else pd.Series({m: np.nan for m in METRICS})
+                if c not in prev_logs_local.columns:
+                    prev_logs_local[c] = 0
+            src["prev"] = (
+                prev_logs_local[METRICS].mean(numeric_only=True)
+                if not prev_logs_local.empty else pd.Series({m: np.nan for m in METRICS})
+            )
 
             def _career_pg_fast(cdf, cols):
                 if cdf.empty or "GP" not in cdf.columns:
@@ -838,7 +691,7 @@ def player_dashboard():
 
             min_proj = st.number_input(
                 "Projected MIN (editable)", min_value=5.0, max_value=48.0,
-                value=float(min_proj_seed), step=0.5,
+                value=float(min_proj_seed), step=0.5
             )
 
             proj = pd.Series(index=["PTS", "REB", "AST", "FG3M", "MIN"], dtype=float)
@@ -880,10 +733,7 @@ def player_dashboard():
                     min_std  = float(hist["MIN"].std() or 0.0)
                     min_mean = float(hist["MIN"].mean() or 1.0)
                     vol_ratio = min_std / max(min_mean, 1.0)
-                    ci_mult = 1.0 + 0.0*vol_ratio if alpha_min_vol is None else 1.0 + alpha_min_vol * vol_ratio
-
-                    z_map = {"70%": 1.04, "80%": 1.28, "90%": 1.64}
-                    z = z_map.get(st.session_state.get("z_level","90%"), 1.64)
+                    ci_mult = 1.0 + alpha_min_vol * vol_ratio
 
                     err_pm = z * sd_pm
                     err = err_pm * np.sqrt(max(min_proj, 1.0)) * ci_mult
@@ -893,7 +743,6 @@ def player_dashboard():
                     lo_raw = (rate_est - err.clip(lower=0)) * min_proj
                     hi_raw = (rate_est + err.clip(lower=0)) * min_proj
 
-                    rel_cap = st.session_state.get("rel_cap", 0.25)
                     lo_cap = base * (1.0 - rel_cap)
                     hi_cap = base * (1.0 + rel_cap)
                     lo = pd.concat([lo_raw, lo_cap], axis=1).max(axis=1)
@@ -908,6 +757,9 @@ def player_dashboard():
             out = out.rename(columns={"FG3M": "3PM"})
             st.dataframe(out, use_container_width=True, height=90)
 
+            norm_w_disp = ", ".join([f"{k.capitalize()}: {w:.2f}" for k, w in norm_w.items()])
+            st.caption(f"Weights → {norm_w_disp}")
+
             if ci_df is not None and not ci_df.empty:
                 st.markdown("**Confidence Band (counts):**")
                 ci_disp = ci_df.reindex(["PTS","REB","AST","FG3M"])
@@ -917,13 +769,12 @@ def player_dashboard():
         except Exception as e:
             st.info(f"Projection temporarily unavailable: {e}")
 
-    st.caption("Notes: Opponent metrics are NBA-only ‘Regular Season’ through today’s ET date (5-min cache). MIN totals from Base (Totals); PACE/ratings from Advanced (PerGame).")
+    st.caption("Notes: Opponent metrics are NBA-only Regular Season through today’s ET date (5-min cache).")
 
 # =====================================================================
 # Team Dashboard
 # =====================================================================
 def team_dashboard():
-    inject_rank_tile_css()
     st.title("NBA Team Dashboard")
 
     @st.cache_data(ttl=CACHE_HOURS*3600, show_spinner=False)
@@ -975,6 +826,7 @@ def team_dashboard():
                 df[c] = pd.to_numeric(df[c], errors="ignore")
         return df.reset_index(drop=True)
 
+    # NEW: Opponent per-game (OPP_* columns)
     @st.cache_data(ttl=CACHE_HOURS*3600, show_spinner=True)
     def fetch_league_team_opponent(season: str) -> pd.DataFrame:
         frames = _retry_api(
@@ -991,66 +843,22 @@ def team_dashboard():
         if df.empty:
             return df
         df = df[df["TEAM_ID"].astype(str).str.startswith("161061")].copy()
-        cols = ["TEAM_ID"] + [c for c in df.columns if c.startswith("OPP_")]
-        return df[cols].reset_index(drop=True)
-
-    @st.cache_data(ttl=CACHE_HOURS*3600, show_spinner=True)
-    def fetch_league_players_pg(season: str, last_n_games: int) -> pd.DataFrame:
-        frames = _retry_api(
-            LeagueDashPlayerStats,
-            dict(
-                season=season,
-                season_type_all_star="Regular Season",
-                league_id_nullable="00",
-                per_mode_detailed="PerGame",
-                last_n_games=last_n_games,
-            ),
-        )
-        df = frames[0] if frames else pd.DataFrame()
-        if df.empty:
-            return df
-        df = df[df["TEAM_ID"].astype(str).str.startswith("161061")].copy()
+        for c in df.columns:
+            if c not in ("TEAM_NAME","TEAM_ABBREVIATION"):
+                df[c] = pd.to_numeric(df[c], errors="ignore")
         return df.reset_index(drop=True)
+
+    def _fmt(v, pct=False, d=1):
+        if pd.isna(v):
+            return "—"
+        if pct:
+            return f"{float(v)*100:.{d}f}%"
+        return f"{float(v):.{d}f}"
 
     def _rank_series(df: pd.DataFrame, col: str, ascending: bool) -> pd.Series:
         if col not in df.columns:
             return pd.Series([np.nan]*len(df))
         return df[col].rank(ascending=ascending, method="min")
-
-    def _select_roster_columns(df: pd.DataFrame) -> pd.DataFrame:
-        colmap = {
-            "TEAM_ABBREVIATION": "TEAM",
-            "PLAYER_NAME": "PLAYER_NAME",
-            "AGE": "AGE",
-            "GP": "GP",
-            "MIN": "MIN",
-            "PTS": "PTS",
-            "REB": "REB",
-            "AST": "AST",
-            "FGM": "FGM",
-            "FGA": "FGA",
-            "FG3M": "FG3M",
-            "FG3A": "FG3A",
-            "FTM": "FTM",
-            "FTA": "FTA",
-            "OREB": "OREB",
-            "DREB": "DREB",
-            "STL": "STL",
-            "BLK": "BLK",
-            "TOV": "TOV",
-            "PF": "PF",
-            "PLUS_MINUS": "PLUS_MINUS",
-        }
-        for c in colmap.keys():
-            if c not in df.columns:
-                df[c] = np.nan
-        out = df[list(colmap.keys())].copy()
-        out.columns = list(colmap.values())
-        return out
-
-    def _auto_height_local(df: pd.DataFrame, row_px=34, header_px=38, max_px=900):
-        rows = max(len(df), 1)
-        return min(max_px, header_px + row_px * rows + 8)
 
     def _ensure_cols(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
         out = df.copy()
@@ -1070,13 +878,14 @@ def team_dashboard():
 
     with st.spinner("Loading league team stats..."):
         trad = fetch_league_team_traditional(season)
-        adv = fetch_league_team_advanced(season)
-        opp = fetch_league_team_opponent(season)
+        adv  = fetch_league_team_advanced(season)
+        opp  = fetch_league_team_opponent(season)
 
     if trad.empty or adv.empty:
         st.error("Could not load team stats. Try refreshing or changing the season.")
         st.stop()
 
+    # Keep only relevant columns (team & opponent)
     TRAD_WANTED = [
         "TEAM_ID","TEAM_NAME","TEAM_ABBREVIATION","GP","W","L","W_PCT",
         "MIN","PTS","FGM","FGA","FG_PCT","FG3M","FG3A","FG3_PCT","FTM","FTA","FT_PCT",
@@ -1087,45 +896,73 @@ def team_dashboard():
     trad_g = _ensure_cols(trad, TRAD_WANTED)[TRAD_WANTED].copy()
     adv_g  = _ensure_cols(adv,  ADV_WANTED)[ADV_WANTED].copy()
 
+    # Opponent: we’ll carry a common set (NBA returns many OPP_* columns; we include the ones we display)
+    OPP_WANTED = [
+        "TEAM_ID",
+        "OPP_PTS","OPP_FGA","OPP_FG_PCT","OPP_FG3A","OPP_FG3_PCT","OPP_FTA","OPP_FT_PCT",
+        "OPP_OREB","OPP_DREB","OPP_REB","OPP_AST","OPP_TOV","OPP_STL","OPP_BLK","OPP_PF"
+    ]
+    opp_g = _ensure_cols(opp, OPP_WANTED)[OPP_WANTED].copy()
+
+    # Merge (team + advanced + opponent)
     merged = pd.merge(trad_g, adv_g, on="TEAM_ID", how="left")
-    if not opp.empty:
-        merged = pd.merge(merged, opp, on="TEAM_ID", how="left")
+    merged = pd.merge(merged, opp_g, on="TEAM_ID", how="left")
 
     # ------- League ranks (1 = best) -------
     def _safe_rank(col, ascending):
         return _rank_series(merged, col, ascending=ascending)
 
     ranks = pd.DataFrame({"TEAM_ID": merged["TEAM_ID"]})
-    # scoring/ratings/pace
+    # Team ranks
     ranks["PTS"]         = _safe_rank("PTS", ascending=False)
-    ranks["NET_RATING"]  = _safe_rank("NET_RATING", ascending=False)
     ranks["OFF_RATING"]  = _safe_rank("OFF_RATING", ascending=False)
-    ranks["DEF_RATING"]  = _safe_rank("DEF_RATING", ascending=True)
+    ranks["DEF_RATING"]  = _safe_rank("DEF_RATING", ascending=True)   # lower is better
+    ranks["NET_RATING"]  = _safe_rank("NET_RATING", ascending=False)
     ranks["PACE"]        = _safe_rank("PACE", ascending=False)
-    # volume/percentages and box stats (ADDED ranks where missing)
-    ranks["FGA"]         = _safe_rank("FGA", ascending=False)
     ranks["FG_PCT"]      = _safe_rank("FG_PCT", ascending=False)
-    ranks["FG3A"]        = _safe_rank("FG3A", ascending=False)
+    ranks["FGA"]         = _safe_rank("FGA", ascending=False)
     ranks["FG3_PCT"]     = _safe_rank("FG3_PCT", ascending=False)
-    ranks["FTA"]         = _safe_rank("FTA", ascending=False)
+    ranks["FG3A"]        = _safe_rank("FG3A", ascending=False)
     ranks["FT_PCT"]      = _safe_rank("FT_PCT", ascending=False)
+    ranks["FTA"]         = _safe_rank("FTA", ascending=False)
+    ranks["STL"]         = _safe_rank("STL", ascending=False)
+    ranks["BLK"]         = _safe_rank("BLK", ascending=False)
+    ranks["TOV"]         = _safe_rank("TOV", ascending=True)          # lower is better
+    ranks["PLUS_MINUS"]  = _safe_rank("PLUS_MINUS", ascending=False)
     ranks["OREB"]        = _safe_rank("OREB", ascending=False)
     ranks["DREB"]        = _safe_rank("DREB", ascending=False)
     ranks["REB"]         = _safe_rank("REB", ascending=False)
-    ranks["AST"]         = _safe_rank("AST", ascending=False)
-    ranks["TOV"]         = _safe_rank("TOV", ascending=True)   # lower is better
-    ranks["STL"]         = _safe_rank("STL", ascending=False)
-    ranks["BLK"]         = _safe_rank("BLK", ascending=False)
-    ranks["PF"]          = _safe_rank("PF",  ascending=True)   # fewer fouls is better
-    ranks["PLUS_MINUS"]  = _safe_rank("PLUS_MINUS", ascending=False)
+    ranks["PF"]          = _safe_rank("PF", ascending=True)           # fewer fouls is better
+
+    # NEW: Opponent ranks (for allowed stats: lower is better unless noted)
+    def _add_opp_rank(col, ascending=True):
+        if col in merged.columns:
+            ranks[col] = _safe_rank(col, ascending=ascending)
+
+    for col, asc in [
+        ("OPP_PTS", True),
+        ("OPP_FGA", True),
+        ("OPP_FG_PCT", True),
+        ("OPP_FG3A", True),
+        ("OPP_FG3_PCT", True),
+        ("OPP_FTA", True),
+        ("OPP_FT_PCT", True),
+        ("OPP_OREB", True),
+        ("OPP_DREB", True),
+        ("OPP_REB", True),
+        ("OPP_AST", True),
+        ("OPP_TOV", False),  # allowing fewer turnovers is "worse" defense, so lower allowed TOV should map to higher rank? We'll treat more opp TOV forced = better -> descending -> ascending=False
+        ("OPP_STL", False),
+        ("OPP_BLK", False),
+        ("OPP_PF",  True),   # fewer opponent FTs from fouls often better; keep lower is better
+    ]:
+        _add_opp_rank(col, ascending=asc)
 
     n_teams = len(merged)
-
     sel = merged[merged["TEAM_ID"] == team_id]
     if sel.empty:
         st.error("Selected team not found in this season dataset.")
         st.stop()
-
     tr = sel.iloc[0]
     rr = ranks[ranks["TEAM_ID"] == team_id].iloc[0]
     record = (
@@ -1134,159 +971,91 @@ def team_dashboard():
         else "—"
     )
 
+    # ------- Tiered metric helper (green / neutral / red by rank tiers) -------
+    def _tier_and_arrow(rank_val):
+        """Return (arrow_str, delta_color_str) based on rank tiers: 1–8 green up, 9–22 neutral, 23–30 red down."""
+        try:
+            r = int(rank_val)
+        except Exception:
+            return "", "off"
+        if 1 <= r <= 8:
+            return "▲", "normal"   # green
+        if 9 <= r <= 22:
+            return "◆", "off"      # neutral
+        return "▼", "inverse"      # red
+
+    def metric_with_rank(col, label, value, rank, pct=False, d=1):
+        """Render a st.metric with rank-aware arrow/color. Delta text shows Rank N/30."""
+        val = _fmt(value, pct=pct, d=d)
+        if pd.isna(rank):
+            st.metric(label, val)
+        else:
+            arrow, dcolor = _tier_and_arrow(rank)
+            delta_txt = f"{arrow} Rank {int(rank)}/{n_teams}"
+            st.metric(label, val, delta=delta_txt, delta_color=dcolor)
+
     # ----------------------- Header -----------------------
     st.subheader(f"{tr['TEAM_NAME']} — {season}")
 
     c_rec, _, _, _, _ = st.columns(5)
     c_rec.metric("Record", record)
 
-    # ----------------------- Tiles — EXACT ORDER requested -----------------------
-    # Order: PTS, NET rating, OFF Rating, DEF Rating, PACE,
-    #        FGA, FG%, 3PA, 3P%, FTA, FT%,
-    #        OREB, DREB, REB, AST, TOV, STL, BLK, PF, +/-.
-    def tile_row(items):
-        cols = st.columns(len(items))
-        for (label, key, pct_flag), col in zip(items, cols):
-            _rank_tile(col, label, tr.get(key), rr.get(key if key != "NET_RATING" else "NET_RATING"), total=n_teams, pct=pct_flag)
+    # Respect requested order: PTS, NET, OFF, DEF, PACE, FGA, FG%, 3PA, 3P%, FTA, FT%, OREB, DREB, REB, AST, TOV, STL, BLK, PF, +/-
+    c1, c2, c3, c4, c5 = st.columns(5)
+    metric_with_rank(c1, "PTS",        tr.get("PTS"),        rr.get("PTS"))
+    metric_with_rank(c2, "NET Rating", tr.get("NET_RATING"), rr.get("NET_RATING"))
+    metric_with_rank(c3, "OFF Rating", tr.get("OFF_RATING"), rr.get("OFF_RATING"))
+    metric_with_rank(c4, "DEF Rating", tr.get("DEF_RATING"), rr.get("DEF_RATING"))
+    metric_with_rank(c5, "PACE",       tr.get("PACE"),       rr.get("PACE"))
 
-    # Row 1 (5)
-    tile_row([
-        ("PTS", "PTS", False),
-        ("NET Rating", "NET_RATING", False),
-        ("OFF Rating", "OFF_RATING", False),
-        ("DEF Rating", "DEF_RATING", False),
-        ("PACE", "PACE", False),
-    ])
-    # Row 2 (5)
-    tile_row([
-        ("FGA", "FGA", False),
-        ("FG%", "FG_PCT", True),
-        ("3PA", "FG3A", False),
-        ("3P%", "FG3_PCT", True),
-        ("FTA", "FTA", False),
-    ])
-    # Row 3 (5)
-    tile_row([
-        ("FT%", "FT_PCT", True),
-        ("OREB", "OREB", False),
-        ("DREB", "DREB", False),
-        ("REB", "REB", False),
-        ("AST", "AST", False),
-    ])
-    # Row 4 (4)
-    tile_row([
-        ("TOV", "TOV", False),
-        ("STL", "STL", False),
-        ("BLK", "BLK", False),
-        ("PF",  "PF",  False),
-    ])
-    # Row 5 (1) — Plus/Minus
-    c_pm, = st.columns(1)
-    _rank_tile(c_pm, "+/-", tr.get("PLUS_MINUS"), rr.get("PLUS_MINUS"), total=n_teams, pct=False)
+    c6, c7, c8, c9, c10 = st.columns(5)
+    metric_with_rank(c6,  "FGA",  tr.get("FGA"),     rr.get("FGA"))
+    metric_with_rank(c7,  "FG%",  tr.get("FG_PCT"),  rr.get("FG_PCT"), pct=True)
+    metric_with_rank(c8,  "3PA",  tr.get("FG3A"),    rr.get("FG3A"))
+    metric_with_rank(c9,  "3P%",  tr.get("FG3_PCT"), rr.get("FG3_PCT"), pct=True)
+    metric_with_rank(c10, "FTA",  tr.get("FTA"),     rr.get("FTA"))
 
-    st.caption("Ranks are relative to all NBA teams (1 = best). Tile color and arrow reflect tier (top/middle/bottom).")
+    c11, c12, c13, c14, c15 = st.columns(5)
+    metric_with_rank(c11, "FT%",  tr.get("FT_PCT"),  rr.get("FT_PCT"), pct=True)
+    metric_with_rank(c12, "OREB", tr.get("OREB"),    rr.get("OREB"))
+    metric_with_rank(c13, "DREB", tr.get("DREB"),    rr.get("DREB"))
+    metric_with_rank(c14, "REB",  tr.get("REB"),     rr.get("REB"))
+    metric_with_rank(c15, "AST",  tr.get("AST"),     rr.get("AST"))
 
-    # ----------------------- Opponent Averages Allowed (Per-Game) -----------------------
-    st.markdown("### Opponent Averages Allowed (Per-Game)")
+    c16, c17, c18, c19, c20 = st.columns(5)
+    metric_with_rank(c16, "TOV",  tr.get("TOV"),        rr.get("TOV"))
+    metric_with_rank(c17, "STL",  tr.get("STL"),        rr.get("STL"))
+    metric_with_rank(c18, "BLK",  tr.get("BLK"),        rr.get("BLK"))
+    metric_with_rank(c19, "PF",   tr.get("PF"),         rr.get("PF"))
+    metric_with_rank(c20, "+/-",  tr.get("PLUS_MINUS"), rr.get("PLUS_MINUS"))
 
-    def _opp_row_team(cols_labels):
-        cols = st.columns(len(cols_labels))
-        for (api_col, label), col in zip(cols_labels, cols):
-            val = tr.get(api_col, np.nan)
-            rank = rr.get(api_col, np.nan)
-            pct = api_col.endswith("_PCT")
-            _rank_tile(col, label, val, rank, total=n_teams, pct=pct)
+    st.caption("Ranks are relative to all NBA teams (1 = best). Arrow/color reflect tier: 1–8 green ▲, 9–22 neutral ◆, 23–30 red ▼.")
 
-    _opp_row_team([
-        ("OPP_PTS",     "Opp PTS"),
-        ("OPP_FGA",     "Opp FGA"),
-        ("OPP_FG_PCT",  "Opp FG%"),
-        ("OPP_FG3A",    "Opp 3PA"),
-        ("OPP_FG3_PCT", "Opp 3P%"),
-    ])
-    _opp_row_team([
-        ("OPP_FTA",     "Opp FTA"),
-        ("OPP_FT_PCT",  "Opp FT%"),
-        ("OPP_OREB",    "Opp OREB"),
-        ("OPP_DREB",    "Opp DREB"),
-        ("OPP_REB",     "Opp REB"),
-    ])
-    _opp_row_team([
-        ("OPP_AST", "Opp AST"),
-        ("OPP_TOV", "Opp TOV"),
-        ("OPP_STL", "Opp STL"),
-        ("OPP_BLK", "Opp BLK"),
-        ("OPP_PF",  "Opp PF"),
-    ])
+    # ----------------------- Opponent (Allowed) Summary -----------------------
+    st.markdown("### Opponent (Allowed) — Season Per-Game")
+    # Group in similar order for readability relative to team tiles
+    oc1, oc2, oc3, oc4, oc5 = st.columns(5)
+    metric_with_rank(oc1, "OPP PTS",       tr.get("OPP_PTS"),      rr.get("OPP_PTS"))
+    metric_with_rank(oc2, "OPP FGA",       tr.get("OPP_FGA"),      rr.get("OPP_FGA"))
+    metric_with_rank(oc3, "OPP FG%",       tr.get("OPP_FG_PCT"),   rr.get("OPP_FG_PCT"), pct=True)
+    metric_with_rank(oc4, "OPP 3PA",       tr.get("OPP_FG3A"),     rr.get("OPP_FG3A"))
+    metric_with_rank(oc5, "OPP 3P%",       tr.get("OPP_FG3_PCT"),  rr.get("OPP_FG3_PCT"), pct=True)
 
-    # ----------------------- Roster tables -----------------------
-    with st.spinner("Loading roster per-game (season / last 5 / last 15)..."):
-        season_pg = fetch_league_players_pg(season, last_n_games=0)
-        last5_pg  = fetch_league_players_pg(season, last_n_games=5)
-        last15_pg = fetch_league_players_pg(season, last_n_games=15)
+    oc6, oc7, oc8, oc9, oc10 = st.columns(5)
+    metric_with_rank(oc6,  "OPP FTA",      tr.get("OPP_FTA"),      rr.get("OPP_FTA"))
+    metric_with_rank(oc7,  "OPP FT%",      tr.get("OPP_FT_PCT"),   rr.get("OPP_FT_PCT"), pct=True)
+    metric_with_rank(oc8,  "OPP OREB",     tr.get("OPP_OREB"),     rr.get("OPP_OREB"))
+    metric_with_rank(oc9,  "OPP DREB",     tr.get("OPP_DREB"),     rr.get("OPP_DREB"))
+    metric_with_rank(oc10, "OPP REB",      tr.get("OPP_REB"),      rr.get("OPP_REB"))
 
-    def _prep_roster(df: pd.DataFrame, team_id: int) -> pd.DataFrame:
-        if df.empty:
-            return pd.DataFrame()
-        out = df[df["TEAM_ID"] == team_id].copy()
-        if out.empty:
-            return out
-        num_like = ["AGE","GP","MIN","PTS","REB","AST","FGM","FGA","FG3M","FG3A","FTM","FTA","OREB","DREB","STL","BLK","TOV","PF","PLUS_MINUS"]
-        for c in num_like:
-            if c in out.columns:
-                out[c] = pd.to_numeric(out[c], errors="coerce")
-        out = _select_roster_columns(out)
-        if "MIN" in out.columns:
-            out = out.sort_values("MIN", ascending=False).reset_index(drop=True)
-        return out
+    oc11, oc12, oc13, oc14, oc15 = st.columns(5)
+    metric_with_rank(oc11, "OPP AST",      tr.get("OPP_AST"),      rr.get("OPP_AST"))
+    metric_with_rank(oc12, "OPP TOV",      tr.get("OPP_TOV"),      rr.get("OPP_TOV"))   # rank computed descending (more forced is better)
+    metric_with_rank(oc13, "OPP STL",      tr.get("OPP_STL"),      rr.get("OPP_STL"))
+    metric_with_rank(oc14, "OPP BLK",      tr.get("OPP_BLK"),      rr.get("OPP_BLK"))
+    metric_with_rank(oc15, "OPP PF",       tr.get("OPP_PF"),       rr.get("OPP_PF"))
 
-    def _num_fmt_map(df: pd.DataFrame):
-        fmts = {}
-        for c in df.columns:
-            if c in ("TEAM","PLAYER_NAME"):
-                continue
-            fmts[c] = "{:.1f}"
-        return fmts
-
-    season_tbl = _prep_roster(season_pg, team_id)
-    last5_tbl  = _prep_roster(last5_pg, team_id)
-    last15_tbl = _prep_roster(last15_pg, team_id)
-
-    st.markdown("### Roster — Season Per-Game")
-    if season_tbl.empty:
-        st.info("No season per-game data for this team.")
-    else:
-        st.dataframe(
-            season_tbl.style.format(_num_fmt_map(season_tbl)),
-            use_container_width=True,
-            height=_auto_height_local(season_tbl),
-        )
-
-    st.markdown("### Roster — Last 5 Games (Per-Game)")
-    if last5_tbl.empty:
-        st.info("No Last 5 per-game data for this team.")
-    else:
-        st.dataframe(
-            last5_tbl.style.format(_num_fmt_map(last5_tbl)),
-            use_container_width=True,
-            height=_auto_height_local(last5_tbl),
-        )
-
-    st.markdown("### Roster — Last 15 Games (Per-Game)")
-    if last15_tbl.empty:
-        st.info("No Last 15 per-game data for this team.")
-    else:
-        st.dataframe(
-            last15_tbl.style.format(_num_fmt_map(last15_tbl)),
-            use_container_width=True,
-            height=_auto_height_local(last15_tbl),
-        )
-
-    st.caption(
-        "Notes: Team stats from NBA.com LeagueDashTeamStats (Traditional & Advanced, Per-Game) + Opponent (Per-Game). "
-        "Player roster per-game from LeagueDashPlayerStats with last_n_games filters (0/5/15). "
-        "All fields displayed are sourced directly from the API (no local shooting derivations)."
-    )
+    st.caption("Opponent (allowed) ranks use directionality where **lower allowed** is generally better; for forced events (TOV/STL/BLK), higher values rank better.")
 
 # =====================================================================
 # App Tabs
