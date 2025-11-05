@@ -857,6 +857,263 @@ def player_dashboard():
 
     st.caption("Notes: Opponent metrics are NBA-only ‘Regular Season’ through today’s ET date (5-min cache). MIN totals from Base (Totals); PACE/ratings from Advanced (PerGame). Per-36 are computed by summing totals first, then scaling to 36.")
 
+    # =====================================================================
+    # NEW: Player Projection — Per-36, Opponent-Adjusted (tunable)
+    # =====================================================================
+    st.markdown("### Player Projection — Per-36, Opponent-Adjusted (tunable)")
+
+    # Build per-36 buckets for projection (single-source of truth)
+    p36_career = pd.Series(per36_from_career_totals(career_df), dtype="float64")
+    p36_prev   = pd.Series(compute_per36_from_logs(get_player_logs(player_id, _prev_season_label(season))), dtype="float64")
+    p36_season = pd.Series(compute_per36_from_logs(logs), dtype="float64")
+    p36_recent_5  = pd.Series(compute_per36_from_logs(logs.head(5)), dtype="float64")
+    p36_recent_10 = pd.Series(compute_per36_from_logs(logs.head(10)), dtype="float64")
+
+    # Last 5 vs opponent per-36 (fixed per your spec)
+    opp_team_id = resolve_team_id(opponent, opp_row)
+    vs_opp_df = get_vs_opponent_games(player_id, opp_team_id) if opp_team_id else pd.DataFrame()
+    p36_vsopp_L5 = pd.Series(compute_per36_from_logs(vs_opp_df.head(5))) if not vs_opp_df.empty else pd.Series({"PTS":np.nan,"REB":np.nan,"AST":np.nan,"PRA":np.nan,"FG2M":np.nan,"FG3M":np.nan,"FTM":np.nan,"OREB":np.nan,"DREB":np.nan})
+
+    # Sidebar-like controls in-line to keep UX local to the section
+    colA, colB, colC, colD = st.columns(4)
+    with colA:
+        exp_min = st.number_input("Expected MIN", min_value=12.0, max_value=44.0, value=float(recent_avg.get("MIN", 32.0)) if pd.notna(recent_avg.get("MIN", np.nan)) else 32.0, step=1.0, help="Projected playing time for the game.")
+    with colB:
+        recent_window = st.selectbox("Recent window", options=["Season", 5, 10, 15, 20], index=2, help="Which recent window feeds the 'recent' bucket.")
+    with colC:
+        k_vol = st.slider("Volume sensitivity (k_vol)", 0.0, 1.5, 0.8, 0.05, help="Scales OPP_FGA/FG3A/FTA and related env stats.")
+    with colD:
+        k_eff = st.slider("Efficiency sensitivity (k_eff)", 0.0, 1.0, 0.3, 0.05, help="Scales OPP_FG%/3P%/FT% effects.")
+
+    colE, colF = st.columns(2)
+    with colE:
+        cap_vol = st.slider("Volume cap (±)", 0.05, 0.35, 0.25, 0.01, help="Max absolute volume adjustment (e.g., FGA/3PA/FTA).")
+    with colF:
+        cap_eff = st.slider("Efficiency cap (±)", 0.02, 0.20, 0.12, 0.01, help="Max absolute efficiency adjustment (FG%/3P%/FT%).")
+
+    # Weights (auto-normalized). Vs Opp fixed to L5 vs opp per your request.
+    st.caption("Set blend weights (auto-normalized). Vs Opp is fixed to Last-5 vs opponent.")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        w_career = st.slider("Career", 0.0, 1.0, 0.10, 0.01)
+    with c2:
+        w_prev   = st.slider("Prev Season", 0.0, 1.0, 0.20, 0.01)
+    with c3:
+        w_season = st.slider("Current Season", 0.0, 1.0, 0.40, 0.01)
+    with c4:
+        w_recent = st.slider("Recent", 0.0, 1.0, 0.30, 0.01)
+    w_vsopp = 0.10  # fixed (Last 5 vs opponent)
+
+    # pick recent p36
+    p36_recent = {
+        "Season": p36_season,
+        5: p36_recent_5,
+        10: p36_recent_10,
+        15: pd.Series(compute_per36_from_logs(logs.head(15))),
+        20: pd.Series(compute_per36_from_logs(logs.head(20))),
+    }[recent_window]
+
+    # normalize weights (include fixed vsopp then renorm the others to 1 - w_vsopp)
+    base_sum = max(1e-9, (w_career + w_prev + w_season + w_recent))
+    scale_other = max(0.0, 1.0 - w_vsopp)
+    w = {
+        "career": (w_career / base_sum) * scale_other,
+        "prev":   (w_prev   / base_sum) * scale_other,
+        "season": (w_season / base_sum) * scale_other,
+        "recent": (w_recent / base_sum) * scale_other,
+        "vsopp":  w_vsopp,
+    }
+
+    # League averages for opponent columns from already-fetched context
+    opp_cols = [c for c in team_ctx.columns if c.startswith("OPP_")]
+    lg_avgs = team_ctx[opp_cols].mean(numeric_only=True)
+
+    def _mult(col, sens, cap):
+        ov = opp_row.get(col, np.nan); la = lg_avgs.get(col, np.nan)
+        if pd.isna(ov) or pd.isna(la) or la == 0:
+            return 1.0
+        raw = (float(ov) - float(la)) / float(la)
+        adj = float(np.clip(raw * sens, -cap, cap))
+        return 1.0 + adj
+
+    # pace factor bounded ±10%
+    lg_pace = float(team_ctx["PACE"].mean(numeric_only=True))
+    pace_factor = float(np.clip(((lg_pace + float(opp_row.get("PACE", lg_pace))) / 2) / max(1e-6, lg_pace), 0.90, 1.10))
+
+    # season % baselines (fallbacks)
+    def _season_pct(m_col, a_col):
+        if m_col not in logs.columns or a_col not in logs.columns: return np.nan
+        m = pd.to_numeric(logs[m_col], errors="coerce").sum()
+        a = pd.to_numeric(logs[a_col], errors="coerce").sum()
+        return (m / a) if a else np.nan
+    fgpct_base = _season_pct("FGM","FGA");   fgpct_base = fgpct_base if pd.notna(fgpct_base) else 0.46
+    fg3pct_base= _season_pct("FG3M","FG3A"); fg3pct_base= fg3pct_base if pd.notna(fg3pct_base) else 0.36
+    ftpct_base = _season_pct("FTM","FTA");   ftpct_base = ftpct_base if pd.notna(ftpct_base) else 0.78
+
+    # multipliers
+    m_FGA = _mult("OPP_FGA",  k_vol, cap_vol)
+    m_3PA = _mult("OPP_FG3A", k_vol, cap_vol)
+    m_FTA = _mult("OPP_FTA",  k_vol, cap_vol)
+    m_FGP = _mult("OPP_FG_PCT",  k_eff, cap_eff)
+    m_3PP = _mult("OPP_FG3_PCT", k_eff, cap_eff)
+    m_FTP = _mult("OPP_FT_PCT",  k_eff, cap_eff)
+    m_OREB= _mult("OPP_OREB", k_vol, min(cap_vol, 0.25))
+    m_DREB= _mult("OPP_DREB", k_vol, min(cap_vol, 0.25))
+    m_AST = _mult("OPP_AST",  k_vol, min(cap_vol, 0.25))
+    m_TOV = _mult("OPP_TOV",  k_vol, min(cap_vol, 0.25))
+
+    # blended per-36
+    p36_blend = (
+        w["career"] * p36_career.fillna(0) +
+        w["prev"]   * p36_prev.fillna(0)   +
+        w["season"] * p36_season.fillna(0) +
+        w["recent"] * p36_recent.fillna(0) +
+        w["vsopp"]  * p36_vsopp_L5.fillna(0)
+    ).astype(float)
+
+    # efficiency caps/adj
+    fgpct_adj  = float(np.clip(fgpct_base  * m_FGP,  0.38, 0.70))
+    fg3pct_adj = float(np.clip(fg3pct_base * m_3PP,  0.25, 0.55))
+    ftpct_adj  = float(np.clip(ftpct_base  * m_FTP,  0.60, 0.95))
+
+    # attempts per-36 from makes per-36 and base %
+    fg3m36 = float(p36_blend.get("FG3M", 0))
+    fg2m36 = float(p36_blend.get("FG2M", 0))
+    ftm36  = float(p36_blend.get("FTM",  0))
+
+    fg3a36_base = fg3m36 / max(1e-6, fg3pct_base)
+    fg2a36_base = fg2m36 / max(1e-6, max(0.40, fgpct_base - 0.5*(fg3pct_base-0.35)))
+    fga36_base  = fg2a36_base + fg3a36_base
+    fta36_base  = ftm36 / max(1e-6, ftpct_base)
+
+    fga36 = fga36_base * m_FGA * pace_factor
+    fg3a36= fg3a36_base * m_3PA * pace_factor
+    fta36 = fta36_base * m_FTA * pace_factor
+    if fga36 > 0: fg3a36 = float(min(fga36*0.90, fg3a36))  # allow a bit more 3PA share post-widening
+    fg2a36 = max(0.0, fga36 - fg3a36)
+
+    scale = float(exp_min) / 36.0
+    FGA = max(0.0, fga36 * scale)
+    FG3A= max(0.0, fg3a36 * scale)
+    FG2A= max(0.0, fg2a36 * scale)
+    FTA = max(0.0, fta36 * scale)
+
+    FG3M = FG3A * fg3pct_adj
+    FG2M = FG2A * np.clip(fgpct_adj * (1 - 0.5*(fg3pct_adj-0.35)), 0.35, 0.75)
+    FGM  = FG2M + FG3M
+    PTS  = 2*FG2M + 3*FG3M + FTA * ftpct_adj
+
+    OREB = max(0.0, float(p36_blend.get("OREB", 0)) * m_OREB * pace_factor * scale)
+    DREB = max(0.0, float(p36_blend.get("DREB", 0)) * m_DREB * pace_factor * scale)
+    REB  = OREB + DREB
+    AST  = max(0.0, float(p36_blend.get("AST", 0))  * m_AST  * pace_factor * scale)
+    TOV  = max(0.0, 0.9 * AST * (m_TOV / max(1e-6, m_AST)))
+
+    proj = {
+        "MIN":exp_min,"PTS":PTS,"REB":REB,"AST":AST,"FGM":FGM,"FGA":FGA,"3PM":FG3M,"3PA":FG3A,"FTM":FTA*ftpct_adj,"FTA":FTA,
+        "OREB":OREB,"DREB":DREB,"TOV":TOV
+    }
+    st.dataframe(pd.DataFrame([proj]).round(2), use_container_width=True)
+
+    with st.expander("Diagnostics"):
+        di = {
+            "pace": pace_factor, "m_FGA": m_FGA, "m_3PA": m_3PA, "m_FTA": m_FTA,
+            "FG% adj": fgpct_adj, "3P% adj": fg3pct_adj, "FT% adj": ftpct_adj
+        }
+        st.write(pd.DataFrame([di]).round(3))
+
+    # Optional quick backtest (last N games this season, uses actual minutes & opponent)
+    with st.expander("Backtest (last N games; current season)"):
+        n_bt = st.slider("Games to backtest", min_value=3, max_value=min(20, len(logs)), value=min(8, len(logs)))
+        if n_bt >= 3:
+            games = logs.head(n_bt).copy()
+            # parse opponent ID from MATCHUP
+            teams_df = pd.DataFrame(static_teams.get_teams())
+            abbr_to_id = dict(zip(teams_df["abbreviation"], teams_df["id"]))
+            games["OPP_ABBR"] = games["MATCHUP"].str.split().str[-1].str.replace(r"[^\w]","",regex=True)
+            games["OPP_ID"]   = games["OPP_ABBR"].map(ABBR_ALIAS)
+            games["OPP_ID"]   = games["OPP_ABBR"].map(abbr_to_id)
+
+            # helper to fetch opponent row by team id
+            team_id_to_abbr = dict(zip(teams_df["id"], teams_df["abbreviation"]))
+            def _opp_ctx_by_id(tid):
+                if pd.isna(tid): return opp_row
+                ab = team_id_to_abbr.get(int(tid))
+                r = team_ctx.loc[team_ctx["TEAM_ABBREVIATION"] == ab]
+                return r.iloc[0] if not r.empty else opp_row
+
+            rows = []
+            for i, r in games.iterrows():
+                opp_row_bak = opp_row
+                this_opp_row = _opp_ctx_by_id(r["OPP_ID"])
+
+                # recompute multipliers for that game
+                def _m(col, sens, cap):
+                    ov = this_opp_row.get(col, np.nan); la = lg_avgs.get(col, np.nan)
+                    if pd.isna(ov) or pd.isna(la) or la == 0: return 1.0
+                    raw = (float(ov) - float(la)) / float(la)
+                    return 1.0 + float(np.clip(raw * sens, -cap, cap))
+
+                mFGA = _m("OPP_FGA", k_vol, cap_vol)
+                m3PA = _m("OPP_FG3A", k_vol, cap_vol)
+                mFTA = _m("OPP_FTA", k_vol, cap_vol)
+                mFGP = _m("OPP_FG_PCT", k_eff, cap_eff)
+                m3PP = _m("OPP_FG3_PCT", k_eff, cap_eff)
+                mFTP = _m("OPP_FT_PCT", k_eff, cap_eff)
+                mORB = _m("OPP_OREB", k_vol, min(cap_vol, 0.25))
+                mDRB = _m("OPP_DREB", k_vol, min(cap_vol, 0.25))
+                mAST = _m("OPP_AST",  k_vol, min(cap_vol, 0.25))
+                mTOV = _m("OPP_TOV",  k_vol, min(cap_vol, 0.25))
+
+                pace_g = float(np.clip(((lg_pace + float(this_opp_row.get("PACE", lg_pace))) / 2) / max(1e-6, lg_pace), 0.90, 1.10))
+
+                # recompute attempts for that game
+                fg3a36 = fg3a36_base * m3PA * pace_g
+                fga36  = fga36_base  * mFGA * pace_g
+                if fga36 > 0: fg3a36 = float(min(fga36*0.90, fg3a36))
+                fg2a36 = max(0.0, fga36 - fg3a36)
+                fta36g = fta36_base * mFTA * pace_g
+
+                sc = float(r["MIN"]) / 36.0
+                FGA_g = max(0.0, fga36  * sc)
+                FG3A_g= max(0.0, fg3a36 * sc)
+                FG2A_g= max(0.0, fg2a36 * sc)
+                FTA_g = max(0.0, fta36g * sc)
+
+                FG3M_g = FG3A_g * float(np.clip(fg3pct_base * m3PP, 0.25, 0.55))
+                FG2M_g = FG2A_g * float(np.clip(fgpct_base  * mFGP, 0.38, 0.70)) * (1 - 0.5*(float(np.clip(fg3pct_base*m3PP,0.25,0.55))-0.35))
+                FGM_g  = FG2M_g + FG3M_g
+                PTS_g  = 2*FG2M_g + 3*FG3M_g + FTA_g * float(np.clip(ftpct_base*mFTP, 0.60, 0.95))
+
+                OREB_g = max(0.0, float(p36_blend.get("OREB", 0)) * mORB * pace_g * sc)
+                DREB_g = max(0.0, float(p36_blend.get("DREB", 0)) * mDRB * pace_g * sc)
+                REB_g  = OREB_g + DREB_g
+                AST_g  = max(0.0, float(p36_blend.get("AST", 0))  * mAST  * pace_g * sc)
+                TOV_g  = max(0.0, 0.9 * AST_g * (mTOV / max(1e-6, mAST)))
+
+                rows.append({
+                    "GAME_DATE": r["GAME_DATE"].date(), "OPP": r["OPP_ABBR"], "MIN": r["MIN"],
+                    "PTS_pred": PTS_g, "PTS_act": r["PTS"],
+                    "REB_pred": REB_g, "REB_act": r["REB"],
+                    "AST_pred": AST_g, "AST_act": r["AST"],
+                })
+
+            bt = pd.DataFrame(rows).round(2)
+            st.dataframe(bt, use_container_width=True)
+            def _mae(x,y): return float(np.mean(np.abs(np.array(x,float)-np.array(y,float))))
+            def _mape(x,y):
+                y = np.array(y,float); x = np.array(x,float); m = y!=0
+                return float(np.mean(np.abs((x[m]-y[m])/y[m]))) if m.any() else np.nan
+            summ = {
+                "PTS_MAE": _mae(bt["PTS_pred"],bt["PTS_act"]),
+                "REB_MAE": _mae(bt["REB_pred"],bt["REB_act"]),
+                "AST_MAE": _mae(bt["AST_pred"],bt["AST_act"]),
+                "PTS_MAPE": _mape(bt["PTS_pred"],bt["PTS_act"]),
+                "REB_MAPE": _mape(bt["REB_pred"],bt["REB_act"]),
+                "AST_MAPE": _mape(bt["AST_pred"],bt["AST_act"]),
+            }
+            st.write(pd.Series(summ).round(3))
+
 # =====================================================================
 # Team Dashboard
 # =====================================================================
